@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.79.1] - 2026-10-17
+
+First `@wengine-ai/pi-subagents` release (fork of `pi-subagents` v0.79.0, maintained for PI Desktop).
+
+### Added
+
+- Live child visibility in `status.json` while a child is still running:
+  - `steps[].sessionFile` is published as soon as the child session exists (new optional
+    `onSessionFile` callback on `RunChildSessionInput`), instead of only on the finish path.
+    The transcript file exists and grows in real time; hosts can now tail it live.
+  - The persisted `workflowChildren` summary carries an `activity` object for running children
+    (built by the existing `workflowChildActivity` factory: `currentTool`, `turnCount`,
+    `tokens`, `toolCount`, …).
+  - `sessionFile` is bounded to 4096 bytes like every other string crossing the status boundary.
+
 ## [0.79.0] - 2026-10-17
 
 ### Highlights
