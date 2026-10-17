@@ -42,3 +42,66 @@ it("bounds UTF-8 and JSON bytes and rejects malformed activity strictly", () => 
 	}
 	assert.throws(() => parseWorkflowChildSummary({ ...summary, children: [{ ...summary.children[0], state: "completed" }] }), /running state/);
 });
+
+it("carries the live step session file and running activity into child rows", () => {
+	const steps = [{
+		workflowKey: "a",
+		agent: "worker",
+		status: "running" as const,
+		sessionFile: "/sessions/child-a.jsonl",
+		currentTool: "bash",
+		currentToolStartedAt: 100,
+		lastActivityAt: 150,
+		toolCount: 3,
+		turnCount: 2,
+		tokens: { input: 8, output: 2, total: 10 },
+	}];
+	const summary = workflowChildSummary({ ...input, steps });
+	const row = summary.children.find((child) => child.childId === "a");
+	assert.equal(row?.sessionFile, "/sessions/child-a.jsonl");
+	assert.equal(row?.activity?.currentTool, "bash");
+	assert.equal(row?.activity?.currentToolStartedAt, 100);
+	assert.equal(row?.activity?.lastActivityAt, 150);
+	assert.equal(row?.activity?.toolCount, 3);
+	assert.equal(row?.activity?.turnCount, 2);
+	assert.equal(row?.activity?.tokens, 10);
+	assert.equal(row?.activity?.inputTokens, 8);
+	assert.equal(row?.activity?.outputTokens, 2);
+	assert.deepEqual(parseWorkflowChildSummary(summary), summary);
+});
+
+it("keeps the step session file on terminal child rows but drops running activity", () => {
+	const summary = workflowChildSummary({ ...input, inventoryComplete: true, workflowState: "completed", steps: [{
+		workflowKey: "a",
+		agent: "worker",
+		status: "completed" as const,
+		sessionFile: "/sessions/child-a.jsonl",
+		currentTool: "bash",
+		currentToolStartedAt: 100,
+		toolCount: 3,
+		turnCount: 2,
+	}]});
+	const row = summary.children.find((child) => child.childId === "a");
+	assert.equal(row?.state, "completed");
+	assert.equal(row?.sessionFile, "/sessions/child-a.jsonl");
+	assert.equal(row?.activity, undefined);
+	assert.deepEqual(parseWorkflowChildSummary(summary), summary);
+});
+
+it("keeps the result session file on child-result rows and preserves a live file across result overwrite", () => {
+	const steps = [{ workflowKey: "a", agent: "worker", status: "running" as const, sessionFile: "/sessions/child-a.jsonl" }];
+	const children = [{ key: "a", state: "completed" as const, ok: true, output: "done", artifactPaths: [], results: [{ sessionFile: "/sessions/from-result.jsonl" }] }];
+	const summary = workflowChildSummary({ ...input, inventoryComplete: true, workflowState: "completed", steps, children: children as never });
+	const row = summary.children.find((child) => child.childId === "a");
+	assert.equal(row?.state, "completed");
+	assert.equal(row?.sessionFile, "/sessions/from-result.jsonl", "a result session file wins over the live step value");
+	const withoutResult = workflowChildSummary({ ...input, inventoryComplete: true, workflowState: "completed", steps, children: [{ key: "a", state: "completed" as const, ok: true, output: "done", artifactPaths: [] }] });
+	assert.equal(withoutResult.children.find((child) => child.childId === "a")?.sessionFile, "/sessions/child-a.jsonl", "the live step value survives the result overwrite when the result has no session");
+});
+
+it("rejects malformed sessionFile fields on child rows", () => {
+	const summary = workflowChildSummary({ ...input, steps: [{ workflowKey: "a", agent: "worker", status: "running" as const, sessionFile: "/sessions/child-a.jsonl" }] });
+	assert.throws(() => parseWorkflowChildSummary({ ...summary, children: [{ ...summary.children[0], sessionFile: 42 }] }), /sessionFile/);
+	assert.throws(() => parseWorkflowChildSummary({ ...summary, children: [{ ...summary.children[0], sessionFile: "界".repeat(1366) }] }), /sessionFile/);
+	assert.throws(() => parseWorkflowChildSummary({ ...summary, children: [{ ...summary.children[0], bogus: "x" }] }), /unsupported fields/);
+});

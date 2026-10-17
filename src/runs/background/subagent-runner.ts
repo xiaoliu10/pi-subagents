@@ -701,6 +701,8 @@ interface SingleStepContext {
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	onAttemptStart?: (attempt: { model?: string; thinking?: string; contextLimit?: number }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
+	/** Reports the live child's transcript path as soon as its session exists; undefined means memory-only storage. */
+	onSessionFile?: (sessionFile: string | undefined) => void;
 	onExternalProcess?: (process: ExternalProcessStatus) => void;
 	prepareExternalActivity?: (cwd: string, signal: AbortSignal) => Promise<void>;
 	onExternalStreamActivity?: () => void;
@@ -1223,6 +1225,7 @@ export async function runSingleStepInner(
 			stopMessage: ctx.stopMessage,
 			onChildEvent: ctx.onChildEvent,
 			onContextWindow: (contextLimit) => ctx.onAttemptStart?.({ ...attemptModel, contextLimit }),
+			onSessionFile: (sessionFile) => ctx.onSessionFile?.(sessionFile),
 			transcriptWriter,
 			toolTimeoutMs: ctx.toolTimeoutMs,
 			runDeadlineAt: ctx.deadlineAt,
@@ -2997,6 +3000,14 @@ export async function runSubagent(
 		statusPayload.lastUpdate = now;
 		writeStatusPayload();
 	};
+	// Records the live child's transcript path the moment its session exists; terminal results keep the last attempt's file.
+	const updateStepSessionFile = (flatIndex: number, sessionFile: string | undefined): void => {
+		const step = statusPayload.steps[flatIndex];
+		if (!step || !sessionFile || step.sessionFile === sessionFile) return;
+		step.sessionFile = sessionFile;
+		statusPayload.lastUpdate = Date.now();
+		writeStatusPayload(false);
+	};
 	// Records a finished child's result on its status step; the sequential and both parallel paths share it.
 	const recordStepResult = (fi: number, singleResult: StepResult, startedAt: number, endedAt: number, recordLaunchContractDigest = false): void => {
 		const step = requiredStatusStep(statusPayload, fi);
@@ -3856,6 +3867,7 @@ export async function runSubagent(
 					toolTimeoutMs: task.toolTimeoutMs ?? config.toolTimeoutMs,
 					onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking, attempt.contextLimit),
 					onChildEvent: (event) => updateStepFromChildEvent(fi, event),
+					onSessionFile: (sessionFile) => updateStepSessionFile(fi, sessionFile),
 					onExternalProcess: (process) => updateExternalProcess(fi, process),
 					prepareExternalActivity: (externalCwd, signal) => prepareExternalActivity(fi, externalCwd, signal),
 					onExternalStreamActivity: () => recordExternalStreamActivity(fi),
@@ -4230,6 +4242,7 @@ export async function runSubagent(
 							toolTimeoutMs: taskForRun.toolTimeoutMs ?? config.toolTimeoutMs,
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking, attempt.contextLimit),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
+							onSessionFile: (sessionFile) => updateStepSessionFile(fi, sessionFile),
 							onExternalProcess: (process) => updateExternalProcess(fi, process),
 							prepareExternalActivity: (externalCwd, signal) => prepareExternalActivity(fi, externalCwd, signal),
 							onExternalStreamActivity: () => recordExternalStreamActivity(fi),
@@ -4581,6 +4594,7 @@ export async function runSubagent(
 				toolTimeoutMs: seqStep.toolTimeoutMs ?? config.toolTimeoutMs,
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking, attempt.contextLimit),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
+				onSessionFile: (sessionFile) => updateStepSessionFile(flatIndex, sessionFile),
 				onExternalProcess: (process) => updateExternalProcess(flatIndex, process),
 				prepareExternalActivity: (externalCwd, signal) => prepareExternalActivity(flatIndex, externalCwd, signal),
 				onExternalStreamActivity: () => recordExternalStreamActivity(flatIndex),

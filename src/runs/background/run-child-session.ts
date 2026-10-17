@@ -96,6 +96,8 @@ export interface RunChildSessionInput {
 	stopMessage?: string;
 	onChildEvent?: (event: ChildEvent) => void;
 	onContextWindow?: (contextWindow: number) => void;
+	/** Reports the live child's transcript path as soon as the session exists, before any event; undefined means memory-only storage. */
+	onSessionFile?: (sessionFile: string | undefined) => void;
 	transcriptWriter?: ChildTranscriptWriter;
 	toolTimeoutMs?: number;
 	runDeadlineAt?: number;
@@ -674,6 +676,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					return;
 				}
 				session = created;
+				input.onSessionFile?.(created.sessionFile);
 				if (created.contextWindow !== undefined) input.onContextWindow?.(created.contextWindow);
 				const steer = created.steer.bind(created);
 				const followUp = created.followUp.bind(created);
