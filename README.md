@@ -4,6 +4,16 @@
 
 # pi-subagents
 
+> **This is the PI Desktop fork** ([`@wengine-ai/pi-subagents`](https://www.npmjs.com/package/@wengine-ai/pi-subagents))
+> of [`nicobailon/pi-subagents`](https://github.com/nicobailon/pi-subagents), maintained by
+> [xiaoliu10](https://github.com/xiaoliu10) for [PI Desktop](https://github.com/xiaoliu10/pi-desktop).
+> It tracks upstream releases and adds live child visibility in `status.json`
+> (`steps[].sessionFile` and the running children's `activity` are published while a child
+> is still running — see [CHANGELOG 0.79.1](./CHANGELOG.md)). Upstream issue:
+> [#2921](https://github.com/nicobailon/pi-subagents/issues/2921).
+
+
+
 `pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
 <https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1>
