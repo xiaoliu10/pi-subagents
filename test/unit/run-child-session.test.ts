@@ -128,6 +128,47 @@ it("reports the created child's context window before prompting", { timeout: 10_
 	assert.equal(promptedAfterReport, true);
 });
 
+it("reports the live child's session file before prompting", { timeout: 10_000 }, async () => {
+	const reported: Array<string | undefined> = [];
+	let promptedAfterReport = false;
+	const session: ChildSession = {
+		subscribe() { return () => {}; },
+		async prompt() { promptedAfterReport = reported.length === 1; },
+		async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+		messages: [], sessionId: "live-file-session", modelId: "mock/model",
+		get sessionFile() { return "/tmp/live-child/session.jsonl"; },
+	};
+	const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
+	await runChildSession({
+		factory,
+		launch,
+		prompt: "report session file",
+		appendChildEvent() {}, writeOutputLine() {},
+		onSessionFile: (sessionFile) => { reported.push(sessionFile); },
+	});
+	assert.deepEqual(reported, ["/tmp/live-child/session.jsonl"]);
+	assert.equal(promptedAfterReport, true, "the session file must be reported before the first prompt runs");
+});
+
+it("reports an undefined session file for memory-only storage before prompting", { timeout: 10_000 }, async () => {
+	const reported: Array<string | undefined> = [];
+	const session: ChildSession = {
+		subscribe() { return () => {}; },
+		async prompt() {},
+		async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+		messages: [], sessionId: "memory-session", modelId: "mock/model",
+	};
+	const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
+	await runChildSession({
+		factory,
+		launch,
+		prompt: "memory storage",
+		appendChildEvent() {}, writeOutputLine() {},
+		onSessionFile: (sessionFile) => { reported.push(sessionFile); },
+	});
+	assert.deepEqual(reported, [undefined]);
+});
+
 
 for (const mode of ["foreground", "background"] as const) {
 	it(`rejects unfinished commands at authoritative ${mode} settlement and still disposes the child`, async () => {

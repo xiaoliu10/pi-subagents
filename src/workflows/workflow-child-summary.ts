@@ -4,6 +4,7 @@ import type { WorkflowScriptChildResult, WorkflowScriptTraceEntry } from "./scri
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TERMINAL_STATES = new Set(["completed", "failed", "paused", "stopped", "rejected", "detached"]);
 const MAX_REQUIRED_ID_BYTES = 4_096;
+const MAX_SESSION_FILE_BYTES = 4_096;
 const ACTIVITY_COUNTERS = ["currentToolStartedAt", "lastActivityAt", "durationMs", "toolCount", "turnCount", "tokens", "inputTokens", "outputTokens"] as const;
 type WorkflowChildLiveProgress = WorkflowChildActivity & Pick<AgentProgress, "agent" | "sessionName" | "model" | "thinking">;
 
@@ -93,18 +94,31 @@ export function workflowChildSummary(input: {
 						: step.status === "rejected" ? "rejected"
 							: step.status === "pending" ? "pending" : "running";
 		const launchResolved = step.async !== undefined || step.sessionFile !== undefined || step.runId !== undefined || step.model !== undefined;
+		const runningActivity = state === "running" ? workflowChildActivity({
+			currentTool: step.currentTool,
+			currentToolStartedAt: step.currentToolStartedAt,
+			lastActivityAt: step.lastActivityAt,
+			toolCount: step.toolCount,
+			turnCount: step.turnCount,
+			tokens: step.tokens?.total,
+			inputTokens: step.tokens?.input,
+			outputTokens: step.tokens?.output,
+		}) : undefined;
 		rows.set(key, {
 			childId: key,
 			state,
 			...(bounded(step.runId, 256) ? { runId: bounded(step.runId, 256) } : {}),
 			...(launchResolved && bounded(step.agent, 256) ? { agent: bounded(step.agent, 256) } : {}),
+			...(bounded(step.sessionFile, MAX_SESSION_FILE_BYTES) ? { sessionFile: bounded(step.sessionFile, MAX_SESSION_FILE_BYTES) } : {}),
 			...(bounded(step.sessionName, 256) ? { sessionName: bounded(step.sessionName, 256) } : {}),
 			...(bounded(step.model, 256) ? { model: bounded(step.model, 256) } : {}),
 			...(bounded(step.thinking, 32) ? { thinking: bounded(step.thinking, 32) } : {}),
+			...(runningActivity && Object.keys(runningActivity).length > 0 ? { activity: runningActivity } : {}),
 		});
 	}
 	for (const child of input.children ?? []) {
 		if (!KEY_PATTERN.test(child.key)) continue;
+		const previous = rows.get(child.key);
 		const result = Array.isArray(child.results) ? child.results.find((value) => value && typeof value === "object") as Record<string, unknown> | undefined : undefined;
 		const state = child.state === "running" ? "running" : child.detached ? "detached" : child.stopped ? "stopped" : child.interrupted ? "paused" : child.ok ? "completed" : result?.acceptance && typeof result.acceptance === "object" && (result.acceptance as { status?: unknown }).status === "rejected" ? "rejected" : "failed";
 		rows.set(child.key, {
@@ -112,6 +126,7 @@ export function workflowChildSummary(input: {
 			state,
 			...(bounded(child.runId, 256) ? { runId: bounded(child.runId, 256) } : {}),
 			...(bounded(child.agent, 256) ? { agent: bounded(child.agent, 256) } : {}),
+			...(bounded(result?.sessionFile, MAX_SESSION_FILE_BYTES) ? { sessionFile: bounded(result?.sessionFile, MAX_SESSION_FILE_BYTES) } : previous?.sessionFile ? { sessionFile: previous.sessionFile } : {}),
 			...(bounded(result?.sessionName, 256) ? { sessionName: bounded(result?.sessionName, 256) } : {}),
 			...(bounded(result?.model, 256) ? { model: bounded(result?.model, 256) } : {}),
 			...(bounded(result?.thinking, 32) ? { thinking: bounded(result?.thinking, 32) } : {}),
@@ -165,16 +180,16 @@ export function parseWorkflowChildSummary(value: unknown): WorkflowChildSummary 
 	const children = input.children.map((row): WorkflowChildSummary["children"][number] => {
 		if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("workflowChildren child row is invalid.");
 		const child = row as Record<string, unknown>;
-		if (Object.keys(child).some((key) => !["childId", "runId", "agent", "sessionName", "model", "thinking", "state", "activity"].includes(key))) throw new Error("workflowChildren child row has unsupported fields.");
+		if (Object.keys(child).some((key) => !["childId", "runId", "agent", "sessionName", "sessionFile", "model", "thinking", "state", "activity"].includes(key))) throw new Error("workflowChildren child row has unsupported fields.");
 		if (typeof child.childId !== "string" || !KEY_PATTERN.test(child.childId)) throw new Error("workflowChildren childId is invalid.");
 		const state = child.state;
 		if (state !== "pending" && state !== "running" && state !== "completed" && state !== "failed" && state !== "paused" && state !== "stopped" && state !== "rejected" && state !== "detached") throw new Error("workflowChildren child state is invalid.");
-		for (const [field, maxBytes] of [["runId", 256], ["agent", 256], ["sessionName", 256], ["model", 256], ["thinking", 32]] as const) {
+		for (const [field, maxBytes] of [["runId", 256], ["agent", 256], ["sessionName", 256], ["sessionFile", MAX_SESSION_FILE_BYTES], ["model", 256], ["thinking", 32]] as const) {
 			if (child[field] !== undefined && bounded(child[field], maxBytes) === undefined) throw new Error(`workflowChildren child ${field} is invalid.`);
 		}
 		const activity = parseActivity(child.activity);
 		if (activity && state !== "running") throw new Error("workflowChildren child activity requires running state.");
-		return { childId: child.childId, state, ...(activity ? { activity } : {}), ...(child.runId ? { runId: child.runId as string } : {}), ...(child.agent ? { agent: child.agent as string } : {}), ...(child.sessionName ? { sessionName: child.sessionName as string } : {}), ...(child.model ? { model: child.model as string } : {}), ...(child.thinking ? { thinking: child.thinking as string } : {}) };
+		return { childId: child.childId, state, ...(activity ? { activity } : {}), ...(child.runId ? { runId: child.runId as string } : {}), ...(child.agent ? { agent: child.agent as string } : {}), ...(child.sessionFile ? { sessionFile: child.sessionFile as string } : {}), ...(child.sessionName ? { sessionName: child.sessionName as string } : {}), ...(child.model ? { model: child.model as string } : {}), ...(child.thinking ? { thinking: child.thinking as string } : {}) };
 	});
 	if (new Set(children.map((child) => child.childId)).size !== children.length) throw new Error("workflowChildren has duplicate childId values.");
 	if (typeof input.parentToolCallId !== "string") throw new Error("workflowChildren.parentToolCallId is invalid.");

@@ -203,6 +203,8 @@ export interface WorkflowChildSummary {
 		agent?: string;
 		/** Human-readable display name for the child session, when derived at launch. */
 		sessionName?: string;
+		/** Child transcript path; present while running and kept after completion when the child kept a session. */
+		sessionFile?: string;
 		model?: string;
 		thinking?: string;
 		/** Present only while a synchronous foreground child is running. */
