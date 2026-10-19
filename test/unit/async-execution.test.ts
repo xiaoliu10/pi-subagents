@@ -202,6 +202,55 @@ describe("async runner execution", () => {
 		assert.equal(result.steps[0]?.allowNestedSubagents, true);
 	});
 
+	it("applies the global config default to runner children that have no agent deadline", () => {
+		// Fails before the fix: children silently used the hidden DEFAULT_ASYNC_TIMEOUT_MS
+		// backstop even when the operator configured a longer global deadline.
+		const result = buildAsyncRunnerSteps("config-default-timeout", {
+			chain: [
+				{ agent: "worker", task: "config default serial" },
+				{ parallel: [{ agent: "worker", task: "config default parallel" }] },
+			],
+			agents: [agent("worker")],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-config-timeout-test"),
+			maxSubagentDepth: 2,
+			configDefaultTimeoutMs: 7_200_000,
+		});
+
+		assert.ok("steps" in result, "expected successful step build");
+		assert.equal(result.steps[0]?.timeoutMs, 7_200_000);
+		const parallel = result.steps[1];
+		assert.ok(parallel && "parallel" in parallel && Array.isArray(parallel.parallel));
+		assert.equal(parallel.parallel[0]?.timeoutMs, 7_200_000);
+	});
+
+	it("keeps agent defaultTimeoutMs above the global config default", () => {
+		const result = buildAsyncRunnerSteps("agent-beats-config-timeout", {
+			chain: [{ agent: "pinned", task: "agent frontmatter wins" }],
+			agents: [{ ...agent("pinned"), defaultTimeoutMs: 7_000 }],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-agent-timeout-test"),
+			maxSubagentDepth: 2,
+			configDefaultTimeoutMs: 7_200_000,
+		});
+
+		assert.ok("steps" in result, "expected successful step build");
+		assert.equal(result.steps[0]?.timeoutMs, 7_000);
+	});
+
+	it("keeps the built-in backstop when no config default is configured", () => {
+		const result = buildAsyncRunnerSteps("builtin-backstop", {
+			chain: [{ agent: "worker", task: "no config default" }],
+			agents: [agent("worker")],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-builtin-backstop-test"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok("steps" in result, "expected successful step build");
+		assert.equal(result.steps[0]?.timeoutMs, DEFAULT_ASYNC_TIMEOUT_MS);
+	});
+
 	it("assigns default and agent-level deadlines to async serial and parallel children", () => {
 		const result = buildAsyncRunnerSteps("timeout-run", {
 			chain: [

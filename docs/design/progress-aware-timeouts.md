@@ -1,6 +1,6 @@
 # Longer subagent deadlines with progress-aware stall protection
 
-Date: 2026-10-19. Status: implementation proposal approved in principle by the operator; exact runtime behavior must be verified before shipping.
+Date: 2026-10-19. Status: implemented on `fix/progress-aware-subagent-timeouts` (see "Implementation reconciliation" below); opt-in by default and disabled for everyone until enabled in config.
 
 ## Intent and authority
 
@@ -45,3 +45,32 @@ Data flow: launch defaults -> agent/call deadline resolution -> child runtime ev
 1. Immediate local config (already written); validate actual resolver and short simulated launches without touching live runs.
 2. Isolated branch implementation, focused tests, integration validation, independent review, OPEN PR in the user's fork. No release without explicit authorization.
 3. Only after a published/approved package is installed, enable new stall settings locally and verify lifecycle behavior. Existing thirty-minute runs are not retroactively extended.
+
+## Implementation reconciliation (what actually shipped)
+
+Verified against the code on this branch; where behavior differs from the proposal above, this section is authoritative.
+
+### Deadline defaults
+
+- `buildAsyncRunnerSteps` resolves each runner child's deadline as `agent.defaultTimeoutMs ?? config.timeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS` (30m backstop kept for unset config). `executeAsyncChain` and both executor call sites (fresh/resume chains and management appends) pass the resolved `config.timeoutMs` down. The runner still caps every child at the parent composite's remaining budget (`runSingleStepWithTimeout`), and async composites still have no default top-level deadline.
+- Scripted-workflow `runs.run` children already inherited the config default through the single-agent launch resolver (`resolveSingleAgentLaunchTimeout`) for async children and the foreground workflow-child path for `async: false`; covered by existing tests, no change needed there.
+
+### Stall policy (opt-in, `control.stallProtection`)
+
+- One shared state machine (`src/runs/shared/stall-guard.ts`) used by both `src/runs/foreground/execution.ts` (foreground, warning via the existing `needs_attention` control event with reason `stall_warning`, cancellation via the existing tool-timeout terminate path) and `src/runs/background/run-child-session.ts` (runner children, warning line into the step output log/progress tab, cancellation via the existing `terminateForTimeout` → abort + bounded settle). No process killing; receipts are `timedOut` with the inactivity cause and preserved partial output.
+- Progress classification lives in one tested helper: changed assistant stream content, completed messages (including tool results and delivered steers), and tool start/end per `toolCallId`. Watchdog/status heartbeats, turn/agent/compaction bookkeeping, provider retries, and byte-identical repeated stream updates never reset the window. Startup silence and no-first-token are covered from guard creation.
+- Coordination tools (`contact_supervisor`, `intercom`, `bg_wait`) suspend the policy while open, and so does an open nested `subagent` delegation call (the nested child is itself bounded and carries its own policy); wake grants a fresh full window. The graceful final drain (`agent_settled` / terminal assistant stop) also suspends — the drain and hard-finish timers own that bounded wait — and a compaction retry that resumes the run re-arms a fresh window.
+- Config resolution follows the existing control ladder: per-call `control.stallProtection` replaces the global value wholesale (including an explicit disable); invalid shapes fall back like other control knobs; the resolved policy is frozen and flows to child runtimes through the existing `controlConfig` plumbing, and async recovery descriptors validate `stallProtection` strictly. `enabled` must be exactly `true`.
+- Deliberate deviations from the proposal: **no automatic checkpoint steer before a stall cancellation** — injecting a prompt into a possibly healthy child derails it on a false positive; the visible warning is the signal. And the wall deadline was never at risk: it stays independent and authoritative (tested with progress flowing).
+
+### Honest unsupported scope (do not claim otherwise)
+
+- Inactivity is a policy threshold, not a proven deadlock. A silent healthy build, a slow provider, or a codemode script wrapping a supervisor wait is indistinguishable from a wedge by events alone. Per-call longer `timeoutMs` does not disable the policy; disable `control.stallProtection` for that call instead.
+- External CLI and external job runner children are unwired: no trustworthy per-tool progress signal exists, so the policy is not applied and never silently claimed for them. Wall deadlines and runner controls still bound them.
+- A child that blocks the host event loop cannot be policed by any in-process timer; abort does not prove descendants exited and cannot recover a blocked host.
+
+### Validation
+
+- New tests: `test/unit/stall-guard.test.ts` (state machine + classifier + resolution), `test/unit/stall-runtime.test.ts` (real foreground `runSync` and background `runChildSession` seams with the repository's factory mocks: true stall cancel with partial output, healthy long work, coordination-wait suspend + fresh window on wake, wall deadline authority, startup silence, no-opt-in behavior unchanged), `subagent-control` resolution/freeze cases, and `async-execution` config-default cases that fail under the old hidden-30m behavior (verified by temporarily reverting).
+- `npm run typecheck` clean; full unit suite and integration suite show failure sets identical to the pristine base commit (pre-existing environment-dependent failures only).
+

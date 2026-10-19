@@ -5,8 +5,10 @@ import {
 	type ControlEventType,
 	type ControlNotificationChannel,
 	type ResolvedControlConfig,
+	type StallProtectionConfig,
 } from "../../shared/types.ts";
 import { isToolTimeoutExempt } from "./tool-timeout.ts";
+import { resolveStallProtection } from "./stall-guard.ts";
 import { createHash } from "node:crypto";
 import { previewDisplayText } from "../../shared/display-text.ts";
 
@@ -38,14 +40,26 @@ function parseControlList<T extends string>(value: unknown, allowed: readonly T[
 	return parsed.length > 0 ? Array.from(new Set(parsed)) : undefined;
 }
 
+/** Strictly validate an untrusted stallProtection override; invalid shapes fall back to the global value. */
+function parseStallProtectionOverride(value: unknown): StallProtectionConfig | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = value as Record<string, unknown>;
+	if (Object.keys(raw).some((key) => key !== "enabled" && key !== "inactivityWindowMs" && key !== "graceMs")) return undefined;
+	if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") return undefined;
+	if (raw.inactivityWindowMs !== undefined && (typeof raw.inactivityWindowMs !== "number" || !Number.isInteger(raw.inactivityWindowMs) || raw.inactivityWindowMs < 1)) return undefined;
+	if (raw.graceMs !== undefined && (typeof raw.graceMs !== "number" || !Number.isInteger(raw.graceMs) || raw.graceMs < 1)) return undefined;
+	return value as StallProtectionConfig;
+}
+
 export function resolveControlConfig(
-	globalConfig?: ControlConfig,
+	globalConfig?: ControlConfig | ResolvedControlConfig,
 	override?: ControlConfig,
 ): ResolvedControlConfig {
 	const enabled = override?.enabled ?? globalConfig?.enabled ?? DEFAULT_CONTROL_CONFIG.enabled;
 	const overrideNeedsAttentionAfterMs = parsePositiveInt(override?.needsAttentionAfterMs);
 	const globalNeedsAttentionAfterMs = parsePositiveInt(globalConfig?.needsAttentionAfterMs);
-	const globalNeedsAttentionAfterMsIsExplicit = (globalConfig as Partial<ResolvedControlConfig> | undefined)?.needsAttentionAfterMsIsExplicit ?? globalNeedsAttentionAfterMs !== undefined;
+	const globalNeedsAttentionAfterMsIsExplicit = (globalConfig as { needsAttentionAfterMsIsExplicit?: boolean } | undefined)?.needsAttentionAfterMsIsExplicit ?? globalNeedsAttentionAfterMs !== undefined;
 	const needsAttentionAfterMs = overrideNeedsAttentionAfterMs
 		?? globalNeedsAttentionAfterMs
 		?? DEFAULT_CONTROL_CONFIG.needsAttentionAfterMs;
@@ -67,7 +81,14 @@ export function resolveControlConfig(
 	const notifyChannels = parseControlList(override?.notifyChannels, CONTROL_NOTIFICATION_CHANNELS)
 		?? parseControlList(globalConfig?.notifyChannels, CONTROL_NOTIFICATION_CHANNELS)
 		?? DEFAULT_CONTROL_CONFIG.notifyChannels;
-	return {
+	// Opt-in only: the merged override wins wholesale, then the global config.
+	// The resolved policy is frozen so hosts can share it with child runtimes
+	// without a mutation path back into parent state.
+	const stallProtection = resolveStallProtection(
+		parseStallProtectionOverride(override?.stallProtection)
+			?? parseStallProtectionOverride(globalConfig?.stallProtection),
+	);
+	return Object.freeze({
 		enabled,
 		needsAttentionAfterMs,
 		needsAttentionAfterMsIsExplicit,
@@ -75,9 +96,10 @@ export function resolveControlConfig(
 		activeNoticeAfterTurns,
 		activeNoticeAfterTokens,
 		failedToolAttemptsBeforeAttention,
-		notifyOn: [...notifyOn],
-		notifyChannels: [...notifyChannels],
-	};
+		...(stallProtection ? { stallProtection } : {}),
+		notifyOn: Object.freeze([...notifyOn]),
+		notifyChannels: Object.freeze([...notifyChannels]),
+	});
 }
 
 function scaledNeedsAttentionAfterMs(config: ResolvedControlConfig, thinking?: string | false): number {

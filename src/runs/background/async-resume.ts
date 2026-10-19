@@ -443,6 +443,14 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		}
 		if (!Array.isArray(control.notifyOn) || control.notifyOn.some((item) => item !== "active_long_running" && item !== "needs_attention")) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.notifyOn is invalid.`);
 		if (!Array.isArray(control.notifyChannels) || control.notifyChannels.some((item) => item !== "event" && item !== "async" && item !== "intercom")) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.notifyChannels is invalid.`);
+		if (control.stallProtection !== undefined) {
+			if (!control.stallProtection || typeof control.stallProtection !== "object" || Array.isArray(control.stallProtection)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection must be an object.`);
+			const stall = control.stallProtection as Record<string, unknown>;
+			if (stall.enabled !== true) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection.enabled must be true (the policy is opt-in and only persists when enabled).`);
+			for (const field of ["inactivityWindowMs", "graceMs"] as const) {
+				if (stall[field] !== undefined && (!Number.isInteger(stall[field]) || (stall[field] as number) < 1)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection.${field} must be a positive integer.`);
+			}
+		}
 	}
 	if (parsed.acceptance !== undefined) parsed.acceptance = normalizeRecoveryAcceptance(parsed.acceptance, descriptorPath);
 	return parsed as unknown as SteeringRecoveryDescriptor;
