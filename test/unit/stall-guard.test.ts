@@ -240,3 +240,46 @@ describe("createStallGuard", () => {
 		assert.equal(harness.warnings.length + harness.cancellations.length, 2, "no further callbacks after cancellation");
 	});
 });
+
+describe("per-call tool progress fingerprints", () => {
+	const event = (type: string, toolCallId?: string, partialResult?: unknown) => ({ type, toolCallId, toolName: "bash", partialResult }) as unknown as ChildSessionEvent;
+	const output = (text: string, revision = 1) => ({ content: [{ type: "text", text }], details: { status: "running", revision } });
+
+	it("only changed text content refreshes, independent of details/metadata or message-stream snapshots", () => {
+		const cache = new Map<string, string | undefined>();
+		const classify = (value: ChildSessionEvent) => childEventStallProgress(value, "model snapshot", cache);
+		classify(event("tool_execution_start", "A"));
+		assert.deepEqual(classify(event("tool_execution_update", "A", output("compiled 1"))), { progress: true, snapshot: "model snapshot" });
+		assert.equal(classify(event("tool_execution_update", "A", output("compiled 1", 2))).progress, false);
+		for (const partialResult of [undefined, {}, { content: [] }, { content: [{ type: "text", text: "   \n" }] }, { content: [{ type: "status", text: "running" }], details: { bytes: 123 } }]) {
+			assert.equal(classify(event("tool_execution_update", "A", partialResult)).progress, false);
+		}
+		assert.equal(classify(event("tool_execution_update", "A", output("compiled 1", 3))).progress, false, "empty/metadata updates cannot erase the content fingerprint");
+		assert.equal(classify(event("tool_execution_update", "A", output("compiled 2"))).progress, true);
+	});
+
+	it("isolates concurrent call IDs and only retains fixed-size digests until end", () => {
+		const cache = new Map<string, string | undefined>();
+		const classify = (value: ChildSessionEvent) => childEventStallProgress(value, undefined, cache);
+		for (const id of ["A", "B"]) {
+			classify(event("tool_execution_start", id));
+			assert.equal(classify(event("tool_execution_update", id, output(`${id} ready`))).progress, true);
+		}
+		for (let revision = 0; revision < 10; revision++) {
+			for (const id of ["A", "B"]) assert.equal(classify(event("tool_execution_update", id, output(`${id} ready`, revision))).progress, false);
+		}
+		const large = "compiler output\n".repeat(100_000);
+		assert.equal(classify(event("tool_execution_update", "A", output(large))).progress, true);
+		assert.equal(cache.get("A")?.length, 64, "never retain the full output string/object");
+		assert.equal(classify(event("tool_execution_update", "A", output(large))).progress, false);
+		assert.equal(classify(event("tool_execution_update", "A", output(`${large}done`))).progress, true, "changes beyond the first chunk are still detected");
+		classify(event("tool_execution_end", "A"));
+		assert.equal(cache.has("A"), false);
+		assert.equal(classify(event("tool_execution_update", "A", output("late output"))).progress, false);
+		assert.equal(classify(event("tool_execution_update", undefined, output("ambiguous"))).progress, false);
+		assert.equal(classify(event("tool_execution_update", "unknown", output("unknown"))).progress, false);
+		assert.equal(cache.size, 1, "unmatched/late events cannot grow the cache");
+		classify(event("tool_execution_end", "B"));
+		assert.equal(cache.size, 0);
+	});
+});

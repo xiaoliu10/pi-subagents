@@ -455,15 +455,15 @@ What counts as progress, decided in one shared, tested state machine:
 
 - Streamed model content that actually changes (genuine text/thinking/tool-call deltas).
 - Completed messages, including tool results and delivered steering input.
-- Tool calls starting or ending; parallel tools are tracked per `toolCallId`.
+- Tool calls starting or ending, and changed non-blank text in `tool_execution_update.partialResult.content` for an active `toolCallId`. Parallel calls have separate fingerprints: alternating unchanged A/B outputs cannot keep a run alive. Empty/whitespace content, `details`/status/heartbeat metadata, identical text snapshots, and unmatched or late updates do not refresh inactivity. The cache retains only one fixed-size digest per active call and is released at tool end or guard disposal; it does not retain cumulative tool output.
 
 What deliberately does **not** count: watchdog and status heartbeats, polling, turn/agent bookkeeping, provider retries, and repeated identical stream metadata (the same message re-emitted). A child that only writes status files is still stalled.
 
 Suspensions and resets:
 
 - An open `contact_supervisor`, `intercom`, or `bg_wait` tool suspends the policy, and so does an open nested `subagent` delegation call: a parent cooperatively waiting on its own bounded child (that child resolves its own deadline and carries its own stall policy) is not a stall. Ending the wait grants a fresh full window, so a suspended timer can never fire immediately after an unblock.
-- Any real progress during the grace window cancels the pending cancellation. Foreground recovery clears the live stall attention state and permits active-long-running notices again; historical warning events remain in the event history. The next stall warns again (one warning per episode).
-- The graceful final drain (`agent_settled`) suspends the policy and withdraws any pending warning/cancellation episode; a compaction retry that resumes the run grants a fresh window and can warn again. Startup silence and a child that never gets its first token are covered by the same window.
+- Any real progress during the grace window cancels the pending cancellation. Foreground recovery withdraws only stall-owned attention, preserving other attention raised before or during the warning and restoring prior activity state; when no independent attention remains, active-long-running notices are permitted again; historical warning events remain in the event history. The next stall warns again (one warning per episode).
+- The graceful final drain (`agent_settled`) suspends the policy and withdraws any pending warning/cancellation episode; the foreground host also removes only the withdrawn stall attention. A compaction retry that resumes the run grants a fresh window and can warn again. Startup silence and a child that never gets its first token are covered by the same window.
 
 Honest limitations — read before enabling:
 

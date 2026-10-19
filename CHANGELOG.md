@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Native foreground and background children now count changed per-call text from `tool_execution_update` as meaningful progress, so a build with continuing output is not cancelled as silent. Identical snapshots, empty output and status metadata do not reset inactivity; fingerprints are isolated by active `toolCallId` and released at tool end/disposal. Foreground stall recovery/withdrawal preserves independent attention reasons, and runtime-replacement/shutdown stops retain their cause during slow settlement.
+
 - Stall warnings in flight are withdrawn when drain/coordination suspends the guard, so a compaction retry starts a fresh protected episode instead of leaving the attempt permanently unprotected. Recovery clears foreground stall attention state and allows active notices again. Disabled foreground control also disables the stall guard; stop/interrupt settlement cannot be relabelled by a late stall callback. Async recovery descriptors fill missing stall-policy fields and reject invalid or overflowing timer values.
 
 - Global `timeoutMs` now reaches ordinary async composite (chain/parallel/workflow runner) children that have no explicit call or agent-frontmatter deadline, instead of a hidden built-in 30-minute backstop. Agent frontmatter still wins, and the runner still caps each child at the parent composite's remaining deadline; async composites keep having no default top-level deadline by design.

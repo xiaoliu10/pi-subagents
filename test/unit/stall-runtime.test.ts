@@ -377,7 +377,7 @@ it("foreground: progress after a stall warning clears attention state and allows
 	release();
 	const result = await run;
 	assert.equal(result.timedOut, undefined);
-	assert.ok(states.slice(beforeRecovery).includes(undefined), "recovery withdraws the stall attention state");
+	assert.ok(states.slice(beforeRecovery).every((state) => state !== "needs_attention"), "recovery withdraws only the stall attention state and restores the prior active state");
 	assert.ok(result.controlEvents?.filter((event) => event.type === "active_long_running").length! >= 2, "active notice is allowed again after recovery");
 	assert.notEqual(states.at(-1), "needs_attention");
 });
@@ -412,5 +412,179 @@ for (const mode of ["foreground", "background"] as const) {
 		assert.equal(result.timedOut, undefined);
 		if (mode === "background") assert.equal(result.interrupted, true);
 		assert.doesNotMatch(result.error ?? "", /stall policy/);
+	});
+}
+
+for (const mode of ["foreground", "background"] as const) {
+	for (const scenario of ["changing output", "metadata only", "identical output", "parallel unchanged output"] as const) {
+		it(`${mode}: tool progress ${scenario} ${scenario === "changing output" ? "keeps healthy work alive" : "does not mask inactivity"}`, { timeout: 15_000 }, async () => {
+			let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
+			let updates = 0;
+			let aborts = 0;
+			let warnings = 0;
+			const calls = scenario === "parallel unchanged output" ? ["build-a", "build-b"] : ["build-a"];
+			const session: ChildSession = {
+				subscribe(handler) { listener = handler; return () => {}; },
+				async prompt() {
+					for (const toolCallId of calls) listener({ type: "tool_execution_start", toolName: "bash", toolCallId, args: {} } as never);
+					// This build outlives the entire inactivity + grace budget, but keeps
+					// reporting meaningful output. Negative cases use the same heartbeat
+					// frequency, without any actual change to that call's output.
+					while (updates < 20 && !aborts) {
+						await sleep(40);
+						if (aborts) break;
+						updates++;
+						const toolCallId = calls[(updates - 1) % calls.length];
+						const content = scenario === "metadata only"
+							? []
+							: [{ type: "text", text: scenario === "changing output" ? `compiled ${updates} modules` : `${toolCallId}: compiled 1 module` }];
+						listener({ type: "tool_execution_update", toolName: "bash", toolCallId,
+							partialResult: { content, details: { status: "running", heartbeat: updates } },
+						} as never);
+					}
+					if (aborts) return;
+					for (const toolCallId of calls) listener({ type: "tool_execution_end", toolName: "bash", toolCallId } as never);
+					listener({ type: "message_end", message: fauxAssistantMessage("build complete") });
+					listener({ type: "agent_settled" });
+				},
+				async steer() {}, async followUp() {}, async abort() { aborts++; }, async dispose() {},
+				messages: [], sessionId: "tool-progress-regression", modelId: "mock/model",
+			};
+			const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
+			const result = mode === "foreground"
+				? await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Build", {
+					childSessionFactory: factory, controlConfig: stallControlConfig(200, 200),
+					onControlEvent(event) { if (event.reason === "stall_warning") warnings++; },
+				})
+				: await runChildSession({ factory, launch, prompt: "Build", stallProtection: stallPolicy(200, 200),
+					appendChildEvent() {}, writeOutputLine(line) { if (line.startsWith("[stall]")) warnings++; },
+				});
+			if (scenario === "changing output") {
+				assert.equal(result.timedOut, undefined, "new tool output must refresh inactivity in both native hosts");
+				assert.equal(result.exitCode, 0);
+				assert.equal(updates, 20);
+				assert.equal(aborts, 0);
+				assert.equal(warnings, 0, "productive updates must not create stall notifications");
+			} else {
+				assert.equal(result.timedOut, true, "unchanged per-call content cannot keep the run alive");
+				assert.equal(result.exitCode, 1);
+				assert.equal(aborts, 1);
+				assert.equal(warnings, 1);
+				assert.ok(updates < 20);
+			}
+		});
+	}
+}
+
+for (const otherAttention of ["before stall", "during stall"] as const) {
+	it(`foreground: withdrawing stall attention preserves tool attention raised ${otherAttention}`, { timeout: 15_000 }, async () => {
+		let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
+		let release!: () => void;
+		let warned!: () => void;
+		const warning = new Promise<void>((resolve) => { warned = resolve; });
+		const hung = new Promise<void>((resolve) => { release = resolve; });
+		const states: Array<string | undefined> = [];
+		const session: ChildSession = {
+			subscribe(handler) { listener = handler; return () => {}; },
+			async prompt() {
+				listener({ type: "tool_execution_start", toolCallId: "A", toolName: "bash", args: { command: "build A" } } as never);
+				listener({ type: "tool_execution_start", toolCallId: "B", toolName: "bash", args: { command: "build B" } } as never);
+				if (otherAttention === "before stall") {
+					// An actual event after the open-tool threshold emits the first
+					// attention without depending on the host's 1s activity tick.
+					await sleep(30);
+					listener({ type: "turn_end" } as never);
+				}
+				await warning;
+				if (otherAttention === "during stall") listener({ type: "turn_end" } as never);
+				// Completion is progress and withdraws the stall, but B remains open
+				// and its independent tool attention must not disappear.
+				listener({ type: "tool_execution_end", toolCallId: "A", toolName: "bash" } as never);
+				listener({ type: "message_end", message: fauxAssistantMessage("done") });
+				listener({ type: "agent_settled" });
+				release();
+				await hung;
+			},
+			async steer() {}, async followUp() {}, async abort() { release(); }, async dispose() {},
+			messages: [], sessionId: "attention-ownership", modelId: "mock/model",
+		};
+		let recoveryIndex = 0;
+		const result = await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Attention", {
+			runId: `tool-attention-${otherAttention.replaceAll(" ", "-")}`,
+			childSessionFactory: { create: async () => session, async dispose() {} },
+			controlConfig: resolveControlConfig({ needsAttentionAfterMs: 600_000, activeNoticeAfterMs: 10,
+				stallProtection: { enabled: true, inactivityWindowMs: 200, graceMs: 600 } }),
+			onControlEvent(event) {
+				if (event.reason === "stall_warning") { recoveryIndex = states.length; warned(); }
+			},
+			onUpdate(update) { states.push(update.details?.progress?.[0]?.activityState); },
+		});
+		assert.equal(result.timedOut, undefined);
+		assert.ok(result.controlEvents?.some((event) => event.reason === "tool_open_threshold"));
+		assert.ok(states.slice(recoveryIndex).every((state) => state === "needs_attention"), "stall withdrawal cannot erase independent attention");
+	});
+}
+
+it("foreground: drain withdrawal clears only stall state before a healthy compaction retry", { timeout: 15_000 }, async () => {
+	let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
+	let warned!: () => void;
+	const warning = new Promise<void>((resolve) => { warned = resolve; });
+	const states: Array<string | undefined> = [];
+	let afterWithdraw = 0;
+	const session: ChildSession = {
+		subscribe(handler) { listener = handler; return () => {}; },
+		async prompt() {
+			await warning;
+			afterWithdraw = states.length;
+			listener({ type: "agent_settled" });
+			listener({ type: "compaction_end", willRetry: true } as never);
+			listener({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "retry recovered" }] } } as never);
+			listener({ type: "message_end", message: fauxAssistantMessage("done") });
+			listener({ type: "agent_settled" });
+		},
+		async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+		messages: [], sessionId: "withdrawn-stall-retry", modelId: "mock/model",
+	};
+	const result = await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Retry", {
+		childSessionFactory: { create: async () => session, async dispose() {} }, controlConfig: stallControlConfig(60, 600),
+		onControlEvent(event) { if (event.reason === "stall_warning") warned(); },
+		onUpdate(update) { states.push(update.details?.progress?.[0]?.activityState); },
+	});
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.timedOut, undefined);
+	assert.equal(result.controlEvents?.filter((event) => event.reason === "stall_warning").length, 1);
+	assert.ok(states.slice(afterWithdraw).every((state) => state !== "needs_attention"), "drain withdrawal must clean stall-owned state even before real recovery");
+});
+
+for (const stop of ["runtime replacement", "host shutdown"] as const) {
+	it(`foreground: ${stop} wins over a warning in flight during slow settlement`, { timeout: 15_000 }, async () => {
+		const reason = "Subagent stopped because the pi-subagents runtime that ran it was replaced (reload or session switch).";
+		let stopChild!: (reason: string) => void;
+		let release!: () => void;
+		let warned!: () => void;
+		const warning = new Promise<void>((resolve) => { warned = resolve; });
+		const hung = new Promise<void>((resolve) => { release = resolve; });
+		const session: ChildSession = {
+			subscribe() { return () => {}; }, async prompt() { await hung; },
+			async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+			messages: [], sessionId: "host-stop-race", modelId: "mock/model",
+		};
+		const run = runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Stop", {
+			childSessionFactory: { create: async () => session, async dispose() {} }, controlConfig: stallControlConfig(60, 200),
+			onChildSession(controls) { stopChild = controls.stop; },
+			onControlEvent(event) { if (event.reason === "stall_warning") warned(); },
+		});
+		await warning;
+		if (stop === "runtime replacement") stopChild(reason);
+		else session.shutDown = true;
+		await sleep(400); // Well past grace, still inside the existing settle window.
+		release();
+		const result = await run;
+		assert.equal(result.timedOut, undefined);
+		assert.equal(result.exitCode, 1);
+		if (stop === "runtime replacement") {
+			assert.equal(result.stopped, true);
+			assert.equal(result.error, reason);
+		} else assert.match(result.error ?? "", /parent session shut down/);
 	});
 }

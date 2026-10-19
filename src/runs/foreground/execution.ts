@@ -811,6 +811,8 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
+		let stallAttentionOwned = false;
+		let stallAttentionRestoreState: AgentProgress["activityState"];
 		type PendingToolResult = { tool: string; path?: string; mutates: boolean; startedAt?: number };
 		// Pi's parallel tool execution emits every tool_execution_start before the first result message,
 		// so results are matched to their call by toolCallId; the last-started slot covers events without one.
@@ -880,6 +882,13 @@ async function runSingleAttempt(
 		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; hasCommandController?: boolean; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			const previous = progress.activityState;
+			if (input.reason === "stall_warning") {
+				if (!stallAttentionOwned) stallAttentionRestoreState = previous;
+				stallAttentionOwned = true;
+			} else if (stallAttentionOwned) {
+				// Attention raised AFTER the stall also belongs to another cause.
+				stallAttentionRestoreState = "needs_attention";
+			}
 			progress.activityState = "needs_attention";
 			const event = buildControlEvent({
 				type: "needs_attention",
@@ -1324,6 +1333,22 @@ async function runSingleAttempt(
 			stallGuard?.setCoordinationWait([...activeToolCalls.values()].some((active) => isStallCoordinationTool(active.tool)));
 		};
 
+		const withdrawStallAttention = (): void => {
+			if (sessionSettled || lifecycleFinished || !stallAttentionOwned) return;
+			stallAttentionOwned = false;
+			progress.activityState = stallAttentionRestoreState;
+			// Never clear attention (or release notice dedup) belonging to another
+			// cause, whether it preceded the stall or arrived during its grace.
+			if (stallAttentionRestoreState !== "needs_attention") {
+				activeLongRunningNotified = false;
+				for (const event of allControlEvents) {
+					if (event.type === "active_long_running") emittedControlEventKeys.delete(controlNotificationKey(event));
+				}
+			}
+			stallAttentionRestoreState = undefined;
+			fireUpdate();
+		};
+
 		// Opt-in progress-aware stall policy (control.stallProtection). Shares one
 		// tested state machine with the background runner's child sessions and only
 		// ever terminates through the existing tool-timeout abort + bounded settle
@@ -1334,26 +1359,17 @@ async function runSingleAttempt(
 		const stallGuard = options.controlConfig?.enabled !== false && options.controlConfig?.stallProtection
 			? createStallGuard(options.controlConfig.stallProtection, {
 				onWarning: () => {
-					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal) return;
+					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal || hostStopReason !== undefined || session?.shutDown) return;
 					emitNeedsAttention(Date.now(), {
 						message: formatStallWarningMessage(options.controlConfig!.stallProtection!),
 						reason: "stall_warning",
 					});
 					fireUpdate();
 				},
-				onRecovered: () => {
-					if (sessionSettled || lifecycleFinished) return;
-					// A recovered child is not attention-worthy: withdraw the visible
-					// state immediately and re-allow active_long_running notices.
-					progress.activityState = undefined;
-					activeLongRunningNotified = false;
-					for (const event of allControlEvents) {
-						if (event.type === "active_long_running") emittedControlEventKeys.delete(controlNotificationKey(event));
-					}
-					fireUpdate();
-				},
+				onRecovered: () => withdrawStallAttention(),
+				onWithdrawn: () => withdrawStallAttention(),
 				onCancel: () => {
-					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal) return;
+					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal || hostStopReason !== undefined || session?.shutDown) return;
 					terminateForToolTimeout(formatStallCancelMessage(options.controlConfig!.stallProtection!));
 				},
 			})

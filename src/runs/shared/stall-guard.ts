@@ -6,7 +6,7 @@
  *
  * What counts as meaningful progress is decided in exactly one place
  * (`childEventStallProgress`): streamed model content, completed messages and
- * tool results, and tool starts/ends. Watchdog status writes, turn/agent
+ * tool results, changed per-call tool output, and tool starts/ends. Watchdog status writes, turn/agent
  * bookkeeping, provider retries, and repeated identical stream metadata do NOT
  * reset the window.
  *
@@ -20,6 +20,7 @@
  * indistinguishable from a wedge by events alone. That is why the window is
  * opt-in, generous, warned about, and overridable per call.
  */
+import { createHash } from "node:crypto";
 import type { ChildSessionEvent } from "./child-session.ts";
 import type { ResolvedStallProtection, StallProtectionConfig } from "../../shared/types.ts";
 import { isToolTimeoutExempt } from "./tool-timeout.ts";
@@ -82,6 +83,8 @@ export interface StallGuardCallbacks {
 	onCancel: (info: { silentMs: number }) => void;
 	/** Fired once per episode when real progress arrives during the grace window, withdrawing the warning and the pending cancellation. */
 	onRecovered?: (info: { silentMs: number }) => void;
+	/** Suspension withdraws a warning without asserting that productive work resumed. */
+	onWithdrawn?: () => void;
 }
 
 export interface StallGuardDeps {
@@ -104,8 +107,33 @@ export interface StallGuard {
 	dispose(): void;
 }
 
+/** Only observable text content is progress; details/status metadata is not.
+ * Hash text in bounded chunks (no full-result JSON/copy), retaining a fixed-size
+ * digest per active toolCallId, not cumulative build output. Full text must be
+ * read to detect changes anywhere, but the additional cache is O(active calls).
+ */
+function toolOutputFingerprint(partialResult: unknown): string | undefined {
+	if (!partialResult || typeof partialResult !== "object") return undefined;
+	const content = (partialResult as { content?: unknown }).content;
+	if (!Array.isArray(content)) return undefined;
+	let hash: ReturnType<typeof createHash> | undefined;
+	for (const part of content) {
+		if (!part || typeof part !== "object") continue;
+		const block = part as { type?: unknown; text?: unknown };
+		if (block.type !== "text" || typeof block.text !== "string" || !/\S/.test(block.text)) continue;
+		hash ??= createHash("sha256");
+		hash.update(`${block.text.length}:`);
+		for (let offset = 0; offset < block.text.length; offset += 16_384) {
+			hash.update(block.text.slice(offset, offset + 16_384), "utf16le");
+		}
+	}
+	return hash?.digest("hex");
+}
+
 /**
- * Pure classification of one child session event for stall purposes.
+ * Classification of one child session event for stall purposes. The optional
+ * toolSnapshots cache holds only active toolCallId fingerprints, updated here
+ * on start/update/end and cleared by the owning guard on dispose/cancellation.
  * `previousSnapshot` carries the last seen assistant stream content so
  * repeated identical metadata (the same message object re-emitted) does not
  * count as progress while genuine deltas do.
@@ -113,6 +141,7 @@ export interface StallGuard {
 export function childEventStallProgress(
 	event: ChildSessionEvent,
 	previousSnapshot: string | undefined,
+	toolSnapshots?: Map<string, string | undefined>,
 ): { progress: boolean; snapshot: string | undefined } {
 	const message = (event as { message?: unknown }).message;
 	switch (event.type) {
@@ -134,9 +163,30 @@ export function childEventStallProgress(
 		case "message_end":
 			// Any completed message (assistant reply, tool result, delivered steer) is progress.
 			return { progress: Boolean(message), snapshot: undefined };
-		case "tool_execution_start":
-		case "tool_execution_end":
+		case "tool_execution_start": {
+			const id = (event as { toolCallId?: unknown }).toolCallId;
+			if (typeof id === "string" && id) toolSnapshots?.set(id, undefined);
 			return { progress: true, snapshot: undefined };
+		}
+		case "tool_execution_end": {
+			const id = (event as { toolCallId?: unknown }).toolCallId;
+			if (typeof id === "string") toolSnapshots?.delete(id);
+			return { progress: true, snapshot: undefined };
+		}
+		case "tool_execution_update": {
+			const update = event as { toolCallId?: unknown; partialResult?: unknown };
+			// Ambiguous/unmatched/late updates cannot create cache entries or let
+			// parallel calls keep each other alive by alternating static snapshots.
+			if (typeof update.toolCallId !== "string" || !toolSnapshots?.has(update.toolCallId)) {
+				return { progress: false, snapshot: previousSnapshot };
+			}
+			const fingerprint = toolOutputFingerprint(update.partialResult);
+			if (fingerprint === undefined || fingerprint === toolSnapshots.get(update.toolCallId)) {
+				return { progress: false, snapshot: previousSnapshot };
+			}
+			toolSnapshots.set(update.toolCallId, fingerprint);
+			return { progress: true, snapshot: previousSnapshot };
+		}
 		default:
 			// turn/agent lifecycle, compaction, auto-retry, watchdog status, usage
 			// ticks: bookkeeping and heartbeats, never progress.
@@ -158,6 +208,7 @@ export function createStallGuard(
 	let waiting = false;
 	let progressAt = now();
 	let streamSnapshot: string | undefined;
+	const toolSnapshots = new Map<string, string | undefined>();
 	let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -199,6 +250,7 @@ export function createStallGuard(
 				warningActive = false;
 				cancelled = true;
 				clearTimers();
+				toolSnapshots.clear();
 				callbacks.onCancel({ silentMs: Math.max(0, now() - progressAt) });
 			}, config.graceMs);
 			graceTimer.unref?.();
@@ -209,7 +261,7 @@ export function createStallGuard(
 	const guard: StallGuard = {
 		observeChildEvent(event) {
 			if (disposed || cancelled) return;
-			const classified = childEventStallProgress(event, streamSnapshot);
+			const classified = childEventStallProgress(event, streamSnapshot, toolSnapshots);
 			streamSnapshot = classified.snapshot;
 			if (!classified.progress) return;
 			const silentMs = Math.max(0, now() - progressAt);
@@ -239,8 +291,12 @@ export function createStallGuard(
 				// episode restarts cleanly (with a fresh warning) if the run resumes
 				// and goes silent again. Without this the stale warningActive flag
 				// would leave the guard inert for the rest of the run.
+				const withdrawWarning = warningActive;
 				warningActive = false;
 				clearTimers();
+				if (withdrawWarning) {
+					try { callbacks.onWithdrawn?.(); } catch { /* Advisory host reporting. */ }
+				}
 				return;
 			}
 			// Waking from a coordination wait grants a fresh interval: the elapsed
@@ -252,6 +308,7 @@ export function createStallGuard(
 		dispose() {
 			if (disposed) return;
 			disposed = true;
+			toolSnapshots.clear();
 			warningActive = false;
 			clearTimers();
 		},
