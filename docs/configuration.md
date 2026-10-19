@@ -449,7 +449,7 @@ An explicit `subagent` call value wins over this default. Choose a value at leas
 }
 ```
 
-Opt-in progress-aware stall protection for native Pi children, in both foreground execution and background runner child sessions. When a child produces no **meaningful progress** for `inactivityWindowMs` (default 30 minutes), it gets a visible `needs_attention` warning; if there is still no progress after `graceMs` (default 2 minutes), the child is cancelled through the existing abort and bounded settlement path. The resulting `timedOut` receipt states the inactivity cause and preserves unfinished streamed text as partial output. The run-level `timeoutMs` deadline stays independent and remains authoritative.
+Opt-in progress-aware stall protection for native Pi children, in both foreground execution and background runner child sessions. In foreground execution it depends on `control.enabled`: setting that to `false` disables the stall guard as well, so a child cannot be cancelled without its warning. Background warning logs are independent of that foreground control-event gate. When a child produces no **meaningful progress** for `inactivityWindowMs` (default 30 minutes), the foreground host emits a `needs_attention` warning. Background child sessions instead write a warning only to the step output log / progress tab: they emit no stall `ControlEvent`, notification, or attention-state change. If there is still no progress after `graceMs` (default 2 minutes), the child is cancelled through the existing abort and bounded settlement path. The resulting `timedOut` receipt states the inactivity cause and preserves unfinished streamed text as partial output. The run-level `timeoutMs` deadline stays independent and remains authoritative.
 
 What counts as progress, decided in one shared, tested state machine:
 
@@ -462,8 +462,8 @@ What deliberately does **not** count: watchdog and status heartbeats, polling, t
 Suspensions and resets:
 
 - An open `contact_supervisor`, `intercom`, or `bg_wait` tool suspends the policy, and so does an open nested `subagent` delegation call: a parent cooperatively waiting on its own bounded child (that child resolves its own deadline and carries its own stall policy) is not a stall. Ending the wait grants a fresh full window, so a suspended timer can never fire immediately after an unblock.
-- Any real progress during the grace window cancels the pending cancellation and the warning; the next stall warns again (one warning per episode).
-- The graceful final drain (`agent_settled`) suspends the policy; a compaction retry that resumes the run grants a fresh window. Startup silence and a child that never gets its first token are covered by the same window.
+- Any real progress during the grace window cancels the pending cancellation. Foreground recovery clears the live stall attention state and permits active-long-running notices again; historical warning events remain in the event history. The next stall warns again (one warning per episode).
+- The graceful final drain (`agent_settled`) suspends the policy and withdraws any pending warning/cancellation episode; a compaction retry that resumes the run grants a fresh window and can warn again. Startup silence and a child that never gets its first token are covered by the same window.
 
 Honest limitations — read before enabling:
 
@@ -472,7 +472,7 @@ Honest limitations — read before enabling:
 - External CLI and external job runner children are **out of scope**: their adapters expose no trustworthy per-tool progress signal, so the policy is not wired for them and never claims protection it cannot deliver. Their wall deadline and runner-level controls still apply.
 - There is no automatic checkpoint steer before a stall cancellation: injecting a prompt into a child that may be mid-build turns a false positive into task derailment. The visible warning is the signal; steer manually if you choose.
 
-Precedence and inheritance: `control.stallProtection` resolves like every other control knob — a per-call `control.stallProtection` replaces the global one wholesale (including `{ "enabled": false }` to opt out per call). The resolved policy is frozen and propagated into child runtimes and async recovery descriptors without a mutation path back into parent state; recovery descriptors reject malformed `stallProtection` shapes. `enabled` must be exactly `true`; window/grace values must be positive integers no greater than `2147483647`, and invalid values fall back to the defaults.
+Precedence and inheritance: `control.stallProtection` resolves like every other control knob — a per-call `control.stallProtection` replaces the global one wholesale (including `{ "enabled": false }` to opt out per call). The resolved policy is frozen and propagated into child runtimes and async recovery descriptors without a mutation path back into parent state; recovery descriptors reject malformed `stallProtection` shapes. `enabled` must be exactly `true`; window/grace values must be positive integers no greater than `2147483647`, and invalid configuration values fall back to the defaults. Persisted recovery descriptors are stricter: missing window/grace fields are filled from policy defaults, but explicit invalid or out-of-range values are rejected before any timers are created.
 
 ## `globalConcurrencyLimit`
 

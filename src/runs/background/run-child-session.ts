@@ -404,7 +404,9 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			for (const key of [...activeToolTimeouts.keys()]) removeToolTimeoutKey(key);
 		};
 		const terminateForTimeout = (message: string): void => {
-			if (settled || promptSettled || timedOut || stopped) return;
+			// An interrupted run settles as interrupted; a stall firing inside the
+			// bounded settle window must not mislabel the receipt as timedOut.
+			if (settled || promptSettled || timedOut || stopped || interrupted) return;
 			timedOut = true;
 			interrupted = false;
 			error = message;
@@ -440,7 +442,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const stallGuard = input.stallProtection
 			? createStallGuard(input.stallProtection, {
 				onWarning: () => {
-					if (settled || promptSettled || timedOut || stopped) return;
+					if (settled || promptSettled || timedOut || stopped || interrupted) return;
 					input.writeOutputLine(`[stall] ${formatStallWarningMessage(input.stallProtection!)}`);
 				},
 				onCancel: () => terminateForTimeout(formatStallCancelMessage(input.stallProtection!)),

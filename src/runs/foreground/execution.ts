@@ -34,6 +34,7 @@ import {
 	DEFAULT_CONTROL_CONFIG,
 	buildControlEvent,
 	claimControlNotification,
+	controlNotificationKey,
 	deriveActivityState,
 	shouldEmitOpenToolAttention,
 	shouldNotifyControlEvent,
@@ -490,7 +491,9 @@ async function runSingleAttempt(
 	const emittedControlEventKeys = new Set<string>();
 	const emitControlEvent = (event: ControlEvent) => {
 		if (!shouldNotifyControlEvent(controlConfig, event)) return;
-		if (!claimControlNotification(controlConfig, event, emittedControlEventKeys)) return;
+		// Stall episodes already deduplicate in the guard. A new episode after a
+		// drain/retry must remain visible even when its message is identical.
+		if (event.reason !== "stall_warning" && !claimControlNotification(controlConfig, event, emittedControlEventKeys)) return;
 		allControlEvents.push(event);
 		pendingControlEvents.push(event);
 		options.onControlEvent?.(event);
@@ -1325,18 +1328,32 @@ async function runSingleAttempt(
 		// tested state machine with the background runner's child sessions and only
 		// ever terminates through the existing tool-timeout abort + bounded settle
 		// path; it never kills processes and never proves a deadlock.
-		const stallGuard = options.controlConfig?.stallProtection
+		// The stall policy is part of the control surface: with control disabled the
+		// warning path cannot emit, so a stall would cancel silently. No control, no
+		// guard — cancellation without warning violates the warn-first contract.
+		const stallGuard = options.controlConfig?.enabled !== false && options.controlConfig?.stallProtection
 			? createStallGuard(options.controlConfig.stallProtection, {
 				onWarning: () => {
-					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut) return;
+					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal) return;
 					emitNeedsAttention(Date.now(), {
 						message: formatStallWarningMessage(options.controlConfig!.stallProtection!),
 						reason: "stall_warning",
 					});
 					fireUpdate();
 				},
+				onRecovered: () => {
+					if (sessionSettled || lifecycleFinished) return;
+					// A recovered child is not attention-worthy: withdraw the visible
+					// state immediately and re-allow active_long_running notices.
+					progress.activityState = undefined;
+					activeLongRunningNotified = false;
+					for (const event of allControlEvents) {
+						if (event.type === "active_long_running") emittedControlEventKeys.delete(controlNotificationKey(event));
+					}
+					fireUpdate();
+				},
 				onCancel: () => {
-					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut) return;
+					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal) return;
 					terminateForToolTimeout(formatStallCancelMessage(options.controlConfig!.stallProtection!));
 				},
 			})

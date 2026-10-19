@@ -287,3 +287,130 @@ it("foreground: without the opt-in nothing changes — a silent child ends only 
 	assert.doesNotMatch(result.error ?? "", /stall policy/);
 	assert.match(result.error ?? "", /stopped before it could complete|Subagent stopped/);
 });
+
+for (const mode of ["foreground", "background"] as const) {
+	for (const resumes of [false, true]) {
+		it(`${mode}: warning in flight survives drain suspension${resumes ? " and compaction re-arm" : " without late cancellation"}`, { timeout: 15_000 }, async () => {
+			let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
+			let release!: () => void;
+			let signalWarning!: () => void;
+			const warned = new Promise<void>((resolve) => { signalWarning = resolve; });
+			const hung = new Promise<void>((resolve) => { release = resolve; });
+			let warnings = 0;
+			const onWarning = () => { warnings++; signalWarning(); };
+			const session: ChildSession = {
+				subscribe(handler) { listener = handler; return () => {}; },
+				async prompt() { await hung; },
+				async steer() {}, async followUp() {}, async abort() { release(); }, async dispose() {},
+				messages: [], sessionId: "warning-drain-session", modelId: "mock/model",
+			};
+			const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
+			const run = mode === "foreground"
+				? runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Retry", {
+					childSessionFactory: factory, controlConfig: stallControlConfig(60, 600),
+					onControlEvent(event) { if (event.reason === "stall_warning") onWarning(); },
+				})
+				: runChildSession({ factory, launch, prompt: "Retry", stallProtection: stallPolicy(60, 600),
+					appendChildEvent() {}, writeOutputLine(line) { if (line.startsWith("[stall]")) onWarning(); },
+				});
+			await warned;
+			listener({ type: "agent_settled" });
+			if (resumes) {
+				listener({ type: "compaction_end", willRetry: true } as never);
+				// Bound the old broken behavior too: release the factory's hung prompt
+				// after 2s so this regression fails rather than orphaning a live attempt.
+				const fallback = setTimeout(release, 2_000);
+				const result = await run;
+				clearTimeout(fallback);
+				assert.equal(result.timedOut, true, "a wedged retried run must still be cancelled");
+				assert.equal(warnings, 2, "resumed silence must start a fresh warning episode");
+			} else {
+				// Past the original cancellation point, but before the 1s drain timer:
+				// settling normally must never be relabelled by a stale stall grace.
+				await sleep(750);
+				release();
+				const result = await run;
+				assert.equal(result.timedOut, undefined);
+				assert.equal(warnings, 1);
+			}
+		});
+	}
+}
+
+it("foreground: control.enabled=false disables the stall guard rather than cancelling without warning", { timeout: 15_000 }, async () => {
+	const { session } = silentAfterStreamSession();
+	const result = await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Wait", {
+		childSessionFactory: { create: async () => session, async dispose() {} },
+		controlConfig: resolveControlConfig({ enabled: false, stallProtection: { enabled: true, inactivityWindowMs: 60, graceMs: 60 } }),
+		signal: AbortSignal.timeout(400),
+	});
+	assert.equal(result.timedOut, undefined);
+	assert.equal(result.controlEvents?.length ?? 0, 0);
+});
+
+it("foreground: progress after a stall warning clears attention state and allows active notices again", { timeout: 15_000 }, async () => {
+	let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
+	let release!: () => void;
+	let signalWarning!: () => void;
+	const warned = new Promise<void>((resolve) => { signalWarning = resolve; });
+	const hung = new Promise<void>((resolve) => { release = resolve; });
+	const states: Array<string | undefined> = [];
+	const session: ChildSession = {
+		subscribe(handler) { listener = handler; return () => {}; },
+		async prompt() {
+			await sleep(10);
+			listener({ type: "agent_start" } as never);
+			await hung;
+		},
+		async steer() {}, async followUp() {}, async abort() { release(); }, async dispose() {},
+		messages: [], sessionId: "recovered-state", modelId: "mock/model",
+	};
+	const run = runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Recover", {
+		childSessionFactory: { create: async () => session, async dispose() {} },
+		controlConfig: resolveControlConfig({ activeNoticeAfterMs: 1, stallProtection: { enabled: true, inactivityWindowMs: 60, graceMs: 600 } }),
+		onControlEvent(event) { if (event.reason === "stall_warning") signalWarning(); },
+		onUpdate(update) { states.push(update.details?.progress?.[0]?.activityState); },
+	});
+	await warned;
+	const beforeRecovery = states.length;
+	listener({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "recovered" }] } } as never);
+	release();
+	const result = await run;
+	assert.equal(result.timedOut, undefined);
+	assert.ok(states.slice(beforeRecovery).includes(undefined), "recovery withdraws the stall attention state");
+	assert.ok(result.controlEvents?.filter((event) => event.type === "active_long_running").length! >= 2, "active notice is allowed again after recovery");
+	assert.notEqual(states.at(-1), "needs_attention");
+});
+
+for (const mode of ["foreground", "background"] as const) {
+	it(`${mode}: an interrupted attempt is not relabelled timedOut while its prompt settles slowly`, { timeout: 15_000 }, async () => {
+		let release!: () => void;
+		let started!: () => void;
+		const ready = new Promise<void>((resolve) => { started = resolve; });
+		const hung = new Promise<void>((resolve) => { release = resolve; });
+		const controller = new AbortController();
+		let interrupt: (() => void) | undefined;
+		const session: ChildSession = {
+			subscribe() { return () => {}; }, async prompt() { started(); await hung; },
+			async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+			messages: [], sessionId: "interrupt-race", modelId: "mock/model",
+		};
+		const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
+		const run = mode === "foreground"
+			? runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Stop", {
+				childSessionFactory: factory, signal: controller.signal, controlConfig: stallControlConfig(60, 100),
+			})
+			: runChildSession({ factory, launch, prompt: "Stop", stallProtection: stallPolicy(60, 100),
+				appendChildEvent() {}, writeOutputLine() {}, registerInterrupt(handler) { interrupt = handler; },
+			});
+		await ready;
+		if (mode === "foreground") controller.abort();
+		else interrupt!();
+		await sleep(350); // Stall grace would have elapsed within the abort/settle window.
+		release();
+		const result = await run;
+		assert.equal(result.timedOut, undefined);
+		if (mode === "background") assert.equal(result.interrupted, true);
+		assert.doesNotMatch(result.error ?? "", /stall policy/);
+	});
+}

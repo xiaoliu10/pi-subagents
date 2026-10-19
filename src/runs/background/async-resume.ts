@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { DIRS, RUNNER_LAUNCHER_NAME_PATTERN, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
+import { resolveStallProtection } from "../shared/stall-guard.ts";
 import { snapshotRequiredChildExtensions } from "../../shared/required-child-extensions.ts";
 import { normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
 import { validateAcceptanceInput } from "../shared/acceptance.ts";
@@ -448,8 +449,19 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 			const stall = control.stallProtection as Record<string, unknown>;
 			if (stall.enabled !== true) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection.enabled must be true (the policy is opt-in and only persists when enabled).`);
 			for (const field of ["inactivityWindowMs", "graceMs"] as const) {
-				if (stall[field] !== undefined && (!Number.isInteger(stall[field]) || (stall[field] as number) < 1)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection.${field} must be a positive integer.`);
+				if (stall[field] !== undefined && (typeof stall[field] !== "number" || !Number.isInteger(stall[field]) || (stall[field] as number) < 1 || (stall[field] as number) > 2_147_483_647)) {
+					throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection.${field} must be a positive integer no larger than 2147483647.`);
+				}
 			}
+			// Missing cross-version fields get concrete defaults; malformed explicit
+			// values are rejected above, never sent directly to a Node timer.
+			const resolved = resolveStallProtection({
+				enabled: true,
+				inactivityWindowMs: stall.inactivityWindowMs as number | undefined,
+				graceMs: stall.graceMs as number | undefined,
+			});
+			if (!resolved) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': controlConfig.stallProtection could not be resolved.`);
+			control.stallProtection = resolved;
 		}
 	}
 	if (parsed.acceptance !== undefined) parsed.acceptance = normalizeRecoveryAcceptance(parsed.acceptance, descriptorPath);

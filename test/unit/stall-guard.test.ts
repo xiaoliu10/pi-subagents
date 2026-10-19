@@ -33,7 +33,7 @@ describe("resolveStallProtection", () => {
 			inactivityWindowMs: 30 * 60 * 1000,
 			graceMs: 2 * 60 * 1000,
 		});
-		assert.equal(resolveStallProtection({ enabled: true, inactivityWindowMs: 0, graceMs: 1.5, graceMs: -3 } as never)?.inactivityWindowMs, 30 * 60 * 1000);
+		assert.equal(resolveStallProtection({ enabled: true, inactivityWindowMs: 0, graceMs: 1.5 })?.inactivityWindowMs, 30 * 60 * 1000);
 		assert.equal(resolveStallProtection({ enabled: true, graceMs: -3 })?.graceMs, 2 * 60 * 1000);
 		assert.equal(resolveStallProtection({ enabled: true, inactivityWindowMs: 2_147_483_648 })?.inactivityWindowMs, 30 * 60 * 1000);
 	});
@@ -176,6 +176,47 @@ describe("createStallGuard", () => {
 		await sleep(60);
 		assert.equal(harness.warnings.length, 1, "after waking, only a full fresh window may warn");
 		harness.guard.dispose();
+	});
+
+	it("a suspension with a warning in flight withdraws the episode and stays protected after wake", async () => {
+		// Regression: suspend while warningActive left warningActive stuck at true,
+		// and the next window's callback returned early — the guard went inert for
+		// the rest of the run.
+		const harness = start({ graceMs: 400 });
+		await sleep(90);
+		assert.equal(harness.warnings.length, 1);
+		assert.equal(harness.guard.isWarning(), true);
+		harness.guard.setCoordinationWait(true);
+		assert.equal(harness.guard.isWarning(), false, "suspending withdraws the warning and the pending cancellation");
+		harness.guard.setCoordinationWait(false);
+		// Far past the original grace point: the run must still be protected.
+		await sleep(60);
+		assert.equal(harness.warnings.length, 2, "a fresh episode warns after a full new window");
+		await sleep(80);
+		assert.equal(harness.cancellations.length, 0, "the new episode's grace is still running");
+		harness.guard.dispose();
+	});
+
+	it("onRecovered fires once per episode when progress lands during the grace window", async () => {
+		const recoveries: number[] = [];
+		const warnings: number[] = [];
+		const guard = createStallGuard(policy(), {
+			onWarning: () => warnings.push(1),
+			onCancel: () => {},
+			onRecovered: ({ silentMs }) => recoveries.push(silentMs),
+		});
+		await sleep(90);
+		assert.equal(warnings.length, 1);
+		guard.observeChildEvent({ type: "tool_execution_end", toolName: "bash" } as unknown as ChildSessionEvent);
+		assert.equal(recoveries.length, 1);
+		assert.ok(recoveries[0] >= 40);
+		// A second stall episode warns again but only recovers when progress lands during ITS grace.
+		await sleep(90);
+		assert.equal(warnings.length, 2);
+		assert.equal(recoveries.length, 1);
+		guard.observeChildEvent({ type: "tool_execution_end", toolName: "bash" } as unknown as ChildSessionEvent);
+		assert.equal(recoveries.length, 2);
+		guard.dispose();
 	});
 
 	it("dispose prevents every late callback", async () => {

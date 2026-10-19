@@ -80,6 +80,8 @@ export function formatStallCancelMessage(config: ResolvedStallProtection): strin
 export interface StallGuardCallbacks {
 	onWarning: (info: { silentMs: number }) => void;
 	onCancel: (info: { silentMs: number }) => void;
+	/** Fired once per episode when real progress arrives during the grace window, withdrawing the warning and the pending cancellation. */
+	onRecovered?: (info: { silentMs: number }) => void;
 }
 
 export interface StallGuardDeps {
@@ -96,7 +98,6 @@ export interface StallGuard {
 	 * full window regardless of how long the child was already silent.
 	 */
 	setCoordinationWait(waiting: boolean): void;
-	inCoordinationWait(): boolean;
 	/** True between the visible warning and either progress (recovery) or cancellation. */
 	isWarning(): boolean;
 	/** Terminal paths must dispose; a disposed guard never fires callbacks. */
@@ -176,7 +177,16 @@ export function createStallGuard(
 		if (inactivityTimer) clearScheduled(inactivityTimer);
 		inactivityTimer = scheduleTimeout(() => {
 			inactivityTimer = undefined;
-			if (disposed || cancelled || waiting || warningActive) return;
+			if (disposed || cancelled || waiting) return;
+			if (warningActive) {
+				// Defensive: a warning is still marked active without its grace timer
+				// (only possible through a stale suspension race). Restart the episode
+				// instead of returning inert — the guard must never lose its protection.
+				warningActive = false;
+				clearTimers();
+				armInactivity();
+				return;
+			}
 			warningActive = true;
 			try {
 				callbacks.onWarning({ silentMs: Math.max(0, now() - progressAt) });
@@ -202,6 +212,7 @@ export function createStallGuard(
 			const classified = childEventStallProgress(event, streamSnapshot);
 			streamSnapshot = classified.snapshot;
 			if (!classified.progress) return;
+			const silentMs = Math.max(0, now() - progressAt);
 			progressAt = now();
 			if (warningActive) {
 				// Real progress arrived during the grace window: cancel the warning
@@ -211,6 +222,11 @@ export function createStallGuard(
 					clearScheduled(graceTimer);
 					graceTimer = undefined;
 				}
+				try {
+					callbacks.onRecovered?.({ silentMs });
+				} catch {
+					// Recovery reporting is advisory; the re-arm below must still happen.
+				}
 			}
 			armInactivity();
 		},
@@ -218,6 +234,12 @@ export function createStallGuard(
 			if (disposed || cancelled || next === waiting) return;
 			waiting = next;
 			if (waiting) {
+				// Suspending also withdraws any warning in flight and its pending
+				// cancellation: a drain/coordination pause is not a recovery, but the
+				// episode restarts cleanly (with a fresh warning) if the run resumes
+				// and goes silent again. Without this the stale warningActive flag
+				// would leave the guard inert for the rest of the run.
+				warningActive = false;
 				clearTimers();
 				return;
 			}
@@ -226,7 +248,6 @@ export function createStallGuard(
 			progressAt = now();
 			armInactivity();
 		},
-		inCoordinationWait: () => waiting,
 		isWarning: () => warningActive,
 		dispose() {
 			if (disposed) return;

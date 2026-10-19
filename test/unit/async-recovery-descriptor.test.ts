@@ -76,6 +76,142 @@ describe("async recovery descriptor", () => {
 		}
 	});
 
+	it("normalizes controlConfig.stallProtection through the policy authority", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-recovery-stall-"));
+		try {
+			fs.writeFileSync(path.join(root, "recovery-descriptor.json"), JSON.stringify({
+				version: 1,
+				runFanoutBudget: runFanoutBudget("run-stall"),
+				sourceRunId: "run-stall",
+				agent: "worker",
+				cwd: root,
+				systemPromptMode: "replace",
+				inheritProjectContext: false,
+				inheritGlobalContext: false,
+				inheritSkills: false,
+				outputMode: "inline",
+				maxSubagentDepth: 2,
+				share: false,
+				controlConfig: {
+					enabled: true,
+					needsAttentionAfterMs: 60_000,
+					activeNoticeAfterMs: 240_000,
+					failedToolAttemptsBeforeAttention: 3,
+					notifyOn: ["active_long_running", "needs_attention"],
+					notifyChannels: ["event", "async", "intercom"],
+					// Missing grace must gain a full default rather than a 0ms timer.
+					stallProtection: { enabled: true, inactivityWindowMs: 100 },
+				},
+			}), "utf-8");
+
+			const descriptor = readAsyncRecoveryDescriptor(root);
+
+			assert.deepEqual(descriptor?.controlConfig?.stallProtection, {
+				enabled: true,
+				inactivityWindowMs: 100,
+				graceMs: 2 * 60 * 1000,
+			});
+			assert.equal(Object.isFrozen(descriptor?.controlConfig?.stallProtection), true);
+			const file = path.join(root, "recovery-descriptor.json");
+			const fixture = JSON.parse(fs.readFileSync(file, "utf-8"));
+			for (const field of ["inactivityWindowMs", "graceMs"]) {
+				for (const invalid of [0, -1, 1.5, 5_000_000_000, "100"]) {
+					fixture.controlConfig.stallProtection = { enabled: true, [field]: invalid };
+					fs.writeFileSync(file, JSON.stringify(fixture));
+					assert.throws(() => readAsyncRecoveryDescriptor(root), /positive integer no larger than 2147483647/);
+				}
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps explicit in-range stallProtection values through descriptor reads", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-recovery-stall-keep-"));
+		try {
+			fs.writeFileSync(path.join(root, "recovery-descriptor.json"), JSON.stringify({
+				version: 1,
+				runFanoutBudget: runFanoutBudget("run-stall-keep"),
+				sourceRunId: "run-stall-keep",
+				agent: "worker",
+				cwd: root,
+				systemPromptMode: "replace",
+				inheritProjectContext: false,
+				inheritGlobalContext: false,
+				inheritSkills: false,
+				outputMode: "inline",
+				maxSubagentDepth: 2,
+				share: false,
+				controlConfig: {
+					enabled: true,
+					needsAttentionAfterMs: 60_000,
+					activeNoticeAfterMs: 240_000,
+					failedToolAttemptsBeforeAttention: 3,
+					notifyOn: ["needs_attention"],
+					notifyChannels: ["event"],
+					stallProtection: { enabled: true, inactivityWindowMs: 1_800_000, graceMs: 120_000 },
+				},
+			}), "utf-8");
+
+			assert.deepEqual(readAsyncRecoveryDescriptor(root)?.controlConfig?.stallProtection, {
+				enabled: true,
+				inactivityWindowMs: 1_800_000,
+				graceMs: 120_000,
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stallProtection that is not an enabled policy object", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-recovery-stall-bad-"));
+		try {
+			const base = {
+				version: 1,
+				runFanoutBudget: runFanoutBudget("run-stall-bad"),
+				sourceRunId: "run-stall-bad",
+				agent: "worker",
+				cwd: root,
+				systemPromptMode: "replace",
+				inheritProjectContext: false,
+				inheritGlobalContext: false,
+				inheritSkills: false,
+				outputMode: "inline",
+				maxSubagentDepth: 2,
+				share: false,
+			};
+			fs.writeFileSync(path.join(root, "recovery-descriptor.json"), JSON.stringify({
+				...base,
+				controlConfig: {
+					enabled: true,
+					needsAttentionAfterMs: 60_000,
+					activeNoticeAfterMs: 240_000,
+					failedToolAttemptsBeforeAttention: 3,
+					notifyOn: ["needs_attention"],
+					notifyChannels: ["event"],
+					stallProtection: { enabled: false },
+				},
+			}), "utf-8");
+			assert.throws(() => readAsyncRecoveryDescriptor(root), /stallProtection.enabled must be true/);
+
+			fs.writeFileSync(path.join(root, "recovery-descriptor.json"), JSON.stringify({
+				...base,
+				controlConfig: {
+					enabled: true,
+					needsAttentionAfterMs: 60_000,
+					activeNoticeAfterMs: 240_000,
+					failedToolAttemptsBeforeAttention: 3,
+					notifyOn: ["needs_attention"],
+					notifyChannels: ["event"],
+					stallProtection: "yes",
+				},
+			}), "utf-8");
+			assert.throws(() => readAsyncRecoveryDescriptor(root), /stallProtection must be an object/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts launchContractDigest written by async execution", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-recovery-digest-"));
 		try {
