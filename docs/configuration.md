@@ -451,6 +451,8 @@ An explicit `subagent` call value wins over this default. Choose a value at leas
 
 Opt-in progress-aware stall protection for native Pi children, in both foreground execution and background runner child sessions. In foreground execution it depends on `control.enabled`: setting that to `false` disables the stall guard as well, so a child cannot be cancelled without its warning. Background warning logs are independent of that foreground control-event gate. When a child produces no **meaningful progress** for `inactivityWindowMs` (default 30 minutes), the foreground host emits a `needs_attention` warning. Background child sessions instead write a warning only to the step output log / progress tab: they emit no stall `ControlEvent`, notification, or attention-state change. If there is still no progress after `graceMs` (default 2 minutes), the child is cancelled through the existing abort and bounded settlement path. The resulting `timedOut` receipt states the inactivity cause and preserves unfinished streamed text as partial output. The run-level `timeoutMs` deadline stays independent and remains authoritative.
 
+`notifyOn` still filters control notifications: removing `needs_attention` from it hides the foreground stall warning while the inactivity cancellation still applies, so keep `needs_attention` enabled when you rely on that warning. A command that keeps printing changing text (for example a spinner loop) counts as progress by design, so it is not cancelled — the policy measures output, not usefulness.
+
 What counts as progress, decided in one shared, tested state machine:
 
 - Streamed model content that actually changes (genuine text/thinking/tool-call deltas).
