@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in progress-aware stall protection under `control.stallProtection` (`enabled`, `inactivityWindowMs` default 30 minutes, `graceMs` default 2 minutes). A native Pi child with no meaningful progress (changed model stream content, completed messages/tool results, tool starts/ends) gets a foreground `needs_attention` stall warning (requiring `control.enabled`); background child warnings appear only in the step output log / progress tab, without a stall `ControlEvent` or notification. The child is then cancelled after the grace through the existing abort + bounded settlement path; the `timedOut` receipt states the inactivity cause and preserves partial output. Status heartbeats, polling, retries, and repeated identical stream metadata never reset the window; coordination waits (`contact_supervisor`, `intercom`, `bg_wait`) suspend it and grant a fresh window on wake; the graceful final drain suspends it. Foreground and background runner child sessions share one tested state machine; the resolved policy is frozen and inherited into child runtimes and validated in async recovery descriptors. Inactivity is a policy threshold, not a proven deadlock: silent healthy tools can look identical, external CLI/job children are explicitly unsupported, and a blocked host event loop cannot be policed. See `docs/configuration.md`.
+
+### Fixed
+
+- Native foreground and background children now count changed per-call text from `tool_execution_update` as meaningful progress, so a build with continuing output is not cancelled as silent. Identical snapshots, empty output and status metadata do not reset inactivity; fingerprints are isolated by active `toolCallId` and released at tool end/disposal. Foreground stall recovery/withdrawal preserves independent attention reasons, and runtime-replacement/shutdown stops retain their cause during slow settlement.
+
+- Stall warnings in flight are withdrawn when drain/coordination suspends the guard, so a compaction retry starts a fresh protected episode instead of leaving the attempt permanently unprotected. Recovery clears foreground stall attention state and allows active notices again. Disabled foreground control also disables the stall guard; stop/interrupt settlement cannot be relabelled by a late stall callback. Async recovery descriptors fill missing stall-policy fields and reject invalid or overflowing timer values.
+
+- Global `timeoutMs` now reaches ordinary async composite (chain/parallel/workflow runner) children that have no explicit call or agent-frontmatter deadline, instead of a hidden built-in 30-minute backstop. Agent frontmatter still wins, and the runner still caps each child at the parent composite's remaining deadline; async composites keep having no default top-level deadline by design.
+
+### Changed
+
+- `resolveControlConfig` output is now frozen (including `notifyOn`/`notifyChannels` and the resolved stall policy) so control configuration can be shared with child runtimes without a mutation path back into parent state.
+
 ## [0.79.1] - 2026-10-17
 
 First `@wengine-ai/pi-subagents` release (fork of `pi-subagents` v0.79.0, maintained for PI Desktop).

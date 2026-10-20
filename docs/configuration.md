@@ -411,7 +411,7 @@ This deadline bounds the whole run. The wait for a single model response is boun
 
 Use it when foreground orchestration or plain async single-agent runs need a longer default than 30 minutes. It does not set async composite top-level deadlines, and it does not replace async fan-out child deadlines.
 
-Composite async runs (async chains, parallel tasks, and scripted workflows) stay unbounded at the top level by design. Their runner children are bounded individually by their own agent or runner defaults, so this value does not cap them. Must be a positive integer no greater than `2147483647` (the largest delay a Node.js timer can honor, roughly 24.8 days); invalid or out-of-range values are ignored and the built-in defaults apply.
+Composite async runs (async chains, parallel tasks, and scripted workflows) stay unbounded at the top level by design. Their runner children are bounded individually: a child without an explicit call or agent-frontmatter `timeoutMs` resolves its own deadline from this config default (falling back to the built-in 30 minutes), and the runner additionally caps every child at the parent's remaining budget when the composite itself has a deadline. Must be a positive integer no greater than `2147483647` (the largest delay a Node.js timer can honor, roughly 24.8 days); invalid or out-of-range values are ignored and the built-in defaults apply.
 
 ## `toolTimeoutMs`
 
@@ -434,6 +434,47 @@ The tool timer tracks each active `toolCallId` separately and never extends the 
 Global default for the async single-agent `checkpointBeforeDeadlineMs` launch option. When an async single-agent run has a run-level deadline, the runner issues a best-effort "checkpoint and stop" steer to the child this many milliseconds before that deadline: finish the current tool call, report changed files, build/test state, remaining work, and commit/PR state, and start no new work. The steer uses the normal steering lifecycle at the child's next tool boundary, so its receipt (requested, routed, delivered) is visible in run status and events, and the ordinary `timeoutMs` kill still applies if the child does not stop.
 
 An explicit `subagent` call value wins over this default. Choose a value at least as long as the child's longest expected tool call; a steer cannot land inside one. When the deadline leaves less than one second of run time before the checkpoint, the checkpoint is disarmed and the run behaves as if the option were absent. The global config value must be a positive integer no greater than `2147483647`; invalid values fail config loading rather than silently disabling the checkpoint.
+
+## `control.stallProtection` (opt-in)
+
+```json
+{
+  "control": {
+    "stallProtection": {
+      "enabled": true,
+      "inactivityWindowMs": 1800000,
+      "graceMs": 120000
+    }
+  }
+}
+```
+
+Opt-in progress-aware stall protection for native Pi children, in both foreground execution and background runner child sessions. In foreground execution it depends on `control.enabled`: setting that to `false` disables the stall guard as well, so a child cannot be cancelled without its warning. Background warning logs are independent of that foreground control-event gate. When a child produces no **meaningful progress** for `inactivityWindowMs` (default 30 minutes), the foreground host emits a `needs_attention` warning. Background child sessions instead write a warning only to the step output log / progress tab: they emit no stall `ControlEvent`, notification, or attention-state change. If there is still no progress after `graceMs` (default 2 minutes), the child is cancelled through the existing abort and bounded settlement path. The resulting `timedOut` receipt states the inactivity cause and preserves unfinished streamed text as partial output. The run-level `timeoutMs` deadline stays independent and remains authoritative.
+
+`notifyOn` still filters control notifications: removing `needs_attention` from it hides the foreground stall warning while the inactivity cancellation still applies, so keep `needs_attention` enabled when you rely on that warning. A command that keeps printing changing text (for example a spinner loop) counts as progress by design, so it is not cancelled — the policy measures output, not usefulness.
+
+What counts as progress, decided in one shared, tested state machine:
+
+- Streamed model content that actually changes (genuine text/thinking/tool-call deltas).
+- Completed messages, including tool results and delivered steering input.
+- Tool calls starting or ending, and changed non-blank text in `tool_execution_update.partialResult.content` for an active `toolCallId`. Parallel calls have separate fingerprints: alternating unchanged A/B outputs cannot keep a run alive. Empty/whitespace content, `details`/status/heartbeat metadata, identical text snapshots, and unmatched or late updates do not refresh inactivity. The cache retains only one fixed-size digest per active call and is released at tool end or guard disposal; it does not retain cumulative tool output.
+
+What deliberately does **not** count: watchdog and status heartbeats, polling, turn/agent bookkeeping, provider retries, and repeated identical stream metadata (the same message re-emitted). A child that only writes status files is still stalled.
+
+Suspensions and resets:
+
+- An open `contact_supervisor`, `intercom`, or `bg_wait` tool suspends the policy, and so does an open nested `subagent` delegation call: a parent cooperatively waiting on its own bounded child (that child resolves its own deadline and carries its own stall policy) is not a stall. Ending the wait grants a fresh full window, so a suspended timer can never fire immediately after an unblock.
+- Any real progress during the grace window cancels the pending cancellation. Foreground recovery withdraws only stall-owned attention, preserving other attention raised before or during the warning and restoring prior activity state; when no independent attention remains, active-long-running notices are permitted again; historical warning events remain in the event history. The next stall warns again (one warning per episode).
+- The graceful final drain (`agent_settled`) suspends the policy and withdraws any pending warning/cancellation episode; the foreground host also removes only the withdrawn stall attention. A compaction retry that resumes the run grants a fresh window and can warn again. Startup silence and a child that never gets its first token are covered by the same window.
+
+Honest limitations — read before enabling:
+
+- **Inactivity is a policy threshold, not a proven deadlock.** A silent but healthy tool (a long quiet build, a slow provider, a codemode script that internally waits on a supervisor decision) is indistinguishable from a wedge by events alone. The warning and grace exist so a false positive costs one cancelled run, not silent acceptance of wedges. For work that legitimately stays silent, pass an explicit longer `timeoutMs` (does not disable this policy) or disable `control.stallProtection` for the call via `control`.
+- The guard cannot police a child that blocks the host event loop; no in-process timer fires there. It also does not kill processes, does not prove descendants exited after abort, and cannot recover a blocked host.
+- External CLI and external job runner children are **out of scope**: their adapters expose no trustworthy per-tool progress signal, so the policy is not wired for them and never claims protection it cannot deliver. Their wall deadline and runner-level controls still apply.
+- There is no automatic checkpoint steer before a stall cancellation: injecting a prompt into a child that may be mid-build turns a false positive into task derailment. The visible warning is the signal; steer manually if you choose.
+
+Precedence and inheritance: `control.stallProtection` resolves like every other control knob — a per-call `control.stallProtection` replaces the global one wholesale (including `{ "enabled": false }` to opt out per call). The resolved policy is frozen and propagated into child runtimes and async recovery descriptors without a mutation path back into parent state; recovery descriptors reject malformed `stallProtection` shapes. `enabled` must be exactly `true`; window/grace values must be positive integers no greater than `2147483647`, and invalid configuration values fall back to the defaults. Persisted recovery descriptors are stricter: missing window/grace fields are filled from policy defaults, but explicit invalid or out-of-range values are rejected before any timers are created.
 
 ## `globalConcurrencyLimit`
 

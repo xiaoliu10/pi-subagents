@@ -9,7 +9,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, assistantMessageError, extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
 import { qualifyModelWithProvider } from "../../shared/model-info.ts";
-import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
+import type { EffectsProjection, ResolvedStallProtection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
 import {
 	acceptChildWatchdogEvent,
 	applyChildWatchdogMessage,
@@ -24,6 +24,7 @@ import { formatSubagentModelVerificationError } from "../shared/model-resolution
 import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
+import { createStallGuard, formatStallCancelMessage, formatStallWarningMessage, isStallCoordinationTool } from "../shared/stall-guard.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
 import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
@@ -101,6 +102,8 @@ export interface RunChildSessionInput {
 	transcriptWriter?: ChildTranscriptWriter;
 	toolTimeoutMs?: number;
 	runDeadlineAt?: number;
+	/** Opt-in progress-aware stall policy resolved from control config; absent keeps the default off. */
+	stallProtection?: ResolvedStallProtection;
 	expectedModelForVerification?: string;
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string }>;
 	modelResponseAliases?: Record<string, string[]>;
@@ -363,9 +366,16 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				agentSettledReceived = false;
 				clearFinalDrainTimers();
 				clearWatchdogTailTimer();
+				// A compaction retry resumed the run: the stall policy gets a fresh window.
+				stallGuard?.setCoordinationWait(false);
 				return;
 			}
-			if (action === "start-drain") startFinalDrain();
+			if (action === "start-drain") {
+				// The run is draining to a graceful settle; the drain and hard-finish
+				// timers own the remaining bounded wait, so stall suspension applies.
+				stallGuard?.setCoordinationWait(true);
+				startFinalDrain();
+			}
 		};
 
 		let toolTimeoutSequence = 0;
@@ -394,7 +404,9 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			for (const key of [...activeToolTimeouts.keys()]) removeToolTimeoutKey(key);
 		};
 		const terminateForTimeout = (message: string): void => {
-			if (settled || promptSettled || timedOut || stopped) return;
+			// An interrupted run settles as interrupted; a stall firing inside the
+			// bounded settle window must not mislabel the receipt as timedOut.
+			if (settled || promptSettled || timedOut || stopped || interrupted) return;
 			timedOut = true;
 			interrupted = false;
 			error = message;
@@ -418,9 +430,30 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			activeToolTimeoutKeysByName.set(toolName, keys);
 		};
 
+		/** Recomputed on tool start/end and at terminal clears: an open coordination/wait tool suspends the stall policy. */
+		const refreshStallCoordinationWait = (): void => {
+			stallGuard?.setCoordinationWait([...activeToolCalls.values()].some((active) => isStallCoordinationTool(active.tool)));
+		};
+
+		// Opt-in progress-aware stall policy, shared state machine with the
+		// foreground runtime. Cancels only through terminateForTimeout: the existing
+		// abort + bounded settle path that already preserves partial output and
+		// reports timedOut with a stated cause. Never kills processes.
+		const stallGuard = input.stallProtection
+			? createStallGuard(input.stallProtection, {
+				onWarning: () => {
+					if (settled || promptSettled || timedOut || stopped || interrupted) return;
+					input.writeOutputLine(`[stall] ${formatStallWarningMessage(input.stallProtection!)}`);
+				},
+				onCancel: () => terminateForTimeout(formatStallCancelMessage(input.stallProtection!)),
+			})
+			: undefined;
+
 		const processEvent = (raw: ChildSessionEvent): void => {
 			if (settled) return;
 			partialOutput.observe(raw);
+			// Fed before the watchdog branch so the shared classifier (not this host) decides what counts as progress.
+			stallGuard?.observeChildEvent(raw);
 			const event = raw as ChildSessionEvent & ChildEvent;
 			appendChildEvent(projectChildSessionEventForJson(raw) as Record<string, unknown>);
 			input.transcriptWriter?.writeChildEvent(projectChildSessionEventForJson(raw) as ChildEvent);
@@ -475,6 +508,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (event.type === "tool_execution_end") {
 				clearActiveToolTimeout(event);
 				removeActiveToolCall(event);
+				refreshStallCoordinationWait();
 				return;
 			}
 
@@ -483,6 +517,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				const toolArgs = event.args && typeof event.args === "object" && !Array.isArray(event.args) ? event.args : {};
 				armToolTimeout({ toolCallId: event.toolCallId, toolName: event.toolName });
 				recordActiveToolCall({ toolCallId: event.toolCallId, toolName: event.toolName, args: toolArgs });
+				refreshStallCoordinationWait();
 				if (event.toolName === "structured_output") {
 					structuredOutputToolInvoked = true;
 					structuredOutputMessageStartIndex = messages.length;
@@ -542,6 +577,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					activeToolCalls.clear();
 					activeToolKeysByName.clear();
 					refreshCurrentTool();
+					refreshStallCoordinationWait();
 					applyChildLifecycle(projectChildLifecycle(event, true, childLifecycleState));
 				}
 			}
@@ -552,6 +588,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearAllToolTimeouts();
+			stallGuard?.dispose();
 			if (abortSettleTimer) {
 				clearTimeout(abortSettleTimer);
 				abortSettleTimer = undefined;

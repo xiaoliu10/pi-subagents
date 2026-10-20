@@ -245,6 +245,8 @@ interface AsyncChainParams {
 	acceptance?: AcceptanceInput;
 	fast?: boolean;
 	timeoutMs?: number;
+	/** Global config.timeoutMs default propagated to each runner child. */
+	configDefaultTimeoutMs?: number;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ResolvedToolBudget;
@@ -402,6 +404,8 @@ export interface AsyncRunnerStepBuildParams {
 	/** Retained snapshot from the launch being continued; takes precedence over the live registry, as in single launches. */
 	requiredExtensions?: RequiredChildExtensionSnapshot;
 	thinkingCeiling?: ThinkingLevel;
+	/** Global config.timeoutMs default for runner children without an agent/frontmatter deadline; undefined keeps the built-in backstop. */
+	configDefaultTimeoutMs?: number;
 }
 
 export type AsyncRunnerStepBuildResult =
@@ -1303,7 +1307,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
-			timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS,
+			// The global config default must reach ordinary workflow/runner children;
+			// without it they silently fell back to the hidden 30m backstop even when
+			// the operator configured a longer global deadline. Agent frontmatter still
+			// wins, and the runner caps each child by the parent's remaining deadline.
+			timeoutMs: a.defaultTimeoutMs ?? params.configDefaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS,
 			toolTimeoutMs: resolvedToolTimeout.toolTimeoutMs,
 			waitToolEnabled: params.waitToolEnabled,
 			waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
@@ -1561,6 +1569,7 @@ export function executeAsyncChain(
 		capabilityCeiling,
 		thinkingCeiling: params.thinkingCeiling,
 		requiredExtensions: params.requiredExtensions,
+		configDefaultTimeoutMs: params.configDefaultTimeoutMs,
 	});
 	if ("error" in built) {
 		try {

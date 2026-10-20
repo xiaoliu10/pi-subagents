@@ -325,6 +325,28 @@ export type ActivityState = "active_long_running" | "needs_attention";
 export type ControlEventType = "active_long_running" | "needs_attention";
 export type ControlNotificationChannel = "event" | "async" | "intercom";
 
+/**
+ * Opt-in progress-aware stall protection. When enabled, a child that produces no
+ * meaningful progress (model stream content, tool completion, real tool progress)
+ * for `inactivityWindowMs` gets a visible warning, then is cancelled after
+ * `graceMs` of continued silence through the existing abort/settlement path.
+ * Status heartbeats, polling, and repeated identical metadata do not reset the
+ * window. Coordination waits (contact_supervisor/intercom/bg_wait tools) suspend
+ * the policy and grant a fresh window when they end. Inactivity is a policy
+ * threshold, not proof of a deadlock: a silent healthy tool can look identical.
+ */
+export interface StallProtectionConfig {
+	enabled?: boolean;
+	inactivityWindowMs?: number;
+	graceMs?: number;
+}
+
+export interface ResolvedStallProtection {
+	enabled: true;
+	inactivityWindowMs: number;
+	graceMs: number;
+}
+
 export interface ControlConfig {
 	enabled?: boolean;
 	needsAttentionAfterMs?: number;
@@ -332,6 +354,7 @@ export interface ControlConfig {
 	activeNoticeAfterTurns?: number;
 	activeNoticeAfterTokens?: number;
 	failedToolAttemptsBeforeAttention?: number;
+	stallProtection?: StallProtectionConfig;
 	notifyOn?: ControlEventType[];
 	notifyChannels?: ControlNotificationChannel[];
 }
@@ -344,8 +367,12 @@ export interface ResolvedControlConfig {
 	activeNoticeAfterTurns?: number;
 	activeNoticeAfterTokens?: number;
 	failedToolAttemptsBeforeAttention: number;
-	notifyOn: ControlEventType[];
-	notifyChannels: ControlNotificationChannel[];
+	/** Present only when stall protection is explicitly opted into; undefined keeps the default off. */
+	stallProtection?: ResolvedStallProtection;
+	/** Frozen with the resolved config so it can be shared with child runtimes without a mutation path. */
+	notifyOn: readonly ControlEventType[];
+	/** Frozen with the resolved config so it can be shared with child runtimes without a mutation path. */
+	notifyChannels: readonly ControlNotificationChannel[];
 }
 
 /**
@@ -386,7 +413,7 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
+	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold" | "stall_warning";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;

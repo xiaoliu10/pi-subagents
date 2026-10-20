@@ -37,6 +37,7 @@ import {
 	type NestedRouteInfo,
 	type NestedRunSummary,
 	type ResolvedControlConfig,
+	type ResolvedStallProtection,
 	type ResolvedToolBudget,
 	type RunFanoutBudgetDescriptor,
 	type SubagentRunMode,
@@ -694,6 +695,8 @@ interface SingleStepContext {
 	toolTimeoutMs?: number;
 	/** Effective step deadline (Date.now() + effective timeout) when a run budget exists. */
 	deadlineAt?: number;
+	/** Opt-in progress-aware stall policy from the run's control config; absent keeps the default off. */
+	stallProtection?: ResolvedStallProtection;
 	childIntercomTarget?: string;
 	orchestratorIntercomTarget?: string;
 	nestedRoute?: NestedRouteInfo;
@@ -1229,6 +1232,7 @@ export async function runSingleStepInner(
 			transcriptWriter,
 			toolTimeoutMs: ctx.toolTimeoutMs,
 			runDeadlineAt: ctx.deadlineAt,
+			stallProtection: ctx.stallProtection,
 			expectedModelForVerification,
 			modelVerificationRegistry: step.modelVerificationRegistry,
 			modelResponseAliases: step.modelResponseAliases,
@@ -3865,6 +3869,7 @@ export async function runSubagent(
 					timeoutMessage,
 					stopMessage,
 					toolTimeoutMs: task.toolTimeoutMs ?? config.toolTimeoutMs,
+					stallProtection: config.controlConfig?.stallProtection,
 					onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking, attempt.contextLimit),
 					onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 					onSessionFile: (sessionFile) => updateStepSessionFile(fi, sessionFile),
@@ -4240,6 +4245,7 @@ export async function runSubagent(
 							timeoutMessage,
 							stopMessage,
 							toolTimeoutMs: taskForRun.toolTimeoutMs ?? config.toolTimeoutMs,
+							stallProtection: config.controlConfig?.stallProtection,
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking, attempt.contextLimit),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 							onSessionFile: (sessionFile) => updateStepSessionFile(fi, sessionFile),
@@ -4592,6 +4598,7 @@ export async function runSubagent(
 				timeoutMessage,
 				stopMessage,
 				toolTimeoutMs: seqStep.toolTimeoutMs ?? config.toolTimeoutMs,
+				stallProtection: config.controlConfig?.stallProtection,
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking, attempt.contextLimit),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
 				onSessionFile: (sessionFile) => updateStepSessionFile(flatIndex, sessionFile),

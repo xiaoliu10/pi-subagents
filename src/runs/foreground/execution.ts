@@ -34,6 +34,7 @@ import {
 	DEFAULT_CONTROL_CONFIG,
 	buildControlEvent,
 	claimControlNotification,
+	controlNotificationKey,
 	deriveActivityState,
 	shouldEmitOpenToolAttention,
 	shouldNotifyControlEvent,
@@ -55,6 +56,7 @@ import {
 import { resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, resolveToolTimeoutMs, toolTimeoutCallKey, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
+import { createStallGuard, formatStallCancelMessage, formatStallWarningMessage, isStallCoordinationTool } from "../shared/stall-guard.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
@@ -489,7 +491,9 @@ async function runSingleAttempt(
 	const emittedControlEventKeys = new Set<string>();
 	const emitControlEvent = (event: ControlEvent) => {
 		if (!shouldNotifyControlEvent(controlConfig, event)) return;
-		if (!claimControlNotification(controlConfig, event, emittedControlEventKeys)) return;
+		// Stall episodes already deduplicate in the guard. A new episode after a
+		// drain/retry must remain visible even when its message is identical.
+		if (event.reason !== "stall_warning" && !claimControlNotification(controlConfig, event, emittedControlEventKeys)) return;
 		allControlEvents.push(event);
 		pendingControlEvents.push(event);
 		options.onControlEvent?.(event);
@@ -738,9 +742,16 @@ async function runSingleAttempt(
 				agentSettledReceived = false;
 				clearFinalDrainTimers();
 				clearWatchdogTailTimer();
+				// A compaction retry resumed the run: the stall policy gets a fresh window.
+				stallGuard?.setCoordinationWait(false);
 				return;
 			}
-			if (action === "start-drain") startFinalDrain();
+			if (action === "start-drain") {
+				// The run is draining to a graceful settle; the drain and hard-finish
+				// timers own the remaining bounded wait, so stall suspension applies.
+				stallGuard?.setCoordinationWait(true);
+				startFinalDrain();
+			}
 		};
 		const childLifecycleState: ChildLifecycleState = { compactionRetryActive: false };
 
@@ -763,6 +774,7 @@ async function runSingleAttempt(
 		const finish = (code: number) => {
 			if (lifecycleFinished) return;
 			lifecycleFinished = true;
+			stallGuard?.dispose();
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearTimeoutTimers();
@@ -799,6 +811,8 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
+		let stallAttentionOwned = false;
+		let stallAttentionRestoreState: AgentProgress["activityState"];
 		type PendingToolResult = { tool: string; path?: string; mutates: boolean; startedAt?: number };
 		// Pi's parallel tool execution emits every tool_execution_start before the first result message,
 		// so results are matched to their call by toolCallId; the last-started slot covers events without one.
@@ -868,6 +882,13 @@ async function runSingleAttempt(
 		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; hasCommandController?: boolean; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			const previous = progress.activityState;
+			if (input.reason === "stall_warning") {
+				if (!stallAttentionOwned) stallAttentionRestoreState = previous;
+				stallAttentionOwned = true;
+			} else if (stallAttentionOwned) {
+				// Attention raised AFTER the stall also belongs to another cause.
+				stallAttentionRestoreState = "needs_attention";
+			}
 			progress.activityState = "needs_attention";
 			const event = buildControlEvent({
 				type: "needs_attention",
@@ -990,6 +1011,8 @@ async function runSingleAttempt(
 		const processEvent = (evt: ChildSessionEvent & { message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown }) => {
 			if (lifecycleFinished) return;
 			partialOutput.observe(evt);
+			// Fed before the watchdog branch so the shared classifier (not this host) decides what counts as progress.
+			stallGuard?.observeChildEvent(evt);
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
 			shared.orcaProgressTab?.event(evt);
@@ -1062,6 +1085,7 @@ async function runSingleAttempt(
 					: {};
 				const activeTool = evt.toolName !== undefined ? recordActiveToolCall(evt as { toolCallId?: unknown; toolName: string }, toolArgs, now) : undefined;
 				if (evt.toolName !== undefined) armToolTimeout(evt as { toolCallId?: unknown; toolName: string });
+				refreshStallCoordinationWait();
 				if (options.structuredOutput && evt.toolName === "structured_output") {
 					structuredOutputToolInvoked = true;
 					structuredOutputMessageStartIndex = result.messages?.length ?? 0;
@@ -1090,6 +1114,7 @@ async function runSingleAttempt(
 					});
 				}
 				refreshCurrentTool();
+				refreshStallCoordinationWait();
 				fireUpdate();
 			}
 
@@ -1148,6 +1173,7 @@ async function runSingleAttempt(
 						activeToolCalls.clear();
 						activeToolKeysByName.clear();
 						refreshCurrentTool();
+						refreshStallCoordinationWait();
 						applyChildLifecycle(projectChildLifecycle(evt, true, childLifecycleState));
 					}
 				}
@@ -1301,6 +1327,53 @@ async function runSingleAttempt(
 			keys.push(key);
 			activeToolTimeoutKeysByName.set(toolName, keys);
 		};
+
+		/** Recomputed on every tool start/end and at terminal clears: any open coordination/wait tool suspends the stall policy. */
+		const refreshStallCoordinationWait = (): void => {
+			stallGuard?.setCoordinationWait([...activeToolCalls.values()].some((active) => isStallCoordinationTool(active.tool)));
+		};
+
+		const withdrawStallAttention = (): void => {
+			if (sessionSettled || lifecycleFinished || !stallAttentionOwned) return;
+			stallAttentionOwned = false;
+			progress.activityState = stallAttentionRestoreState;
+			// Never clear attention (or release notice dedup) belonging to another
+			// cause, whether it preceded the stall or arrived during its grace.
+			if (stallAttentionRestoreState !== "needs_attention") {
+				activeLongRunningNotified = false;
+				for (const event of allControlEvents) {
+					if (event.type === "active_long_running") emittedControlEventKeys.delete(controlNotificationKey(event));
+				}
+			}
+			stallAttentionRestoreState = undefined;
+			fireUpdate();
+		};
+
+		// Opt-in progress-aware stall policy (control.stallProtection). Shares one
+		// tested state machine with the background runner's child sessions and only
+		// ever terminates through the existing tool-timeout abort + bounded settle
+		// path; it never kills processes and never proves a deadlock.
+		// The stall policy is part of the control surface: with control disabled the
+		// warning path cannot emit, so a stall would cancel silently. No control, no
+		// guard — cancellation without warning violates the warn-first contract.
+		const stallGuard = options.controlConfig?.enabled !== false && options.controlConfig?.stallProtection
+			? createStallGuard(options.controlConfig.stallProtection, {
+				onWarning: () => {
+					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal || hostStopReason !== undefined || session?.shutDown) return;
+					emitNeedsAttention(Date.now(), {
+						message: formatStallWarningMessage(options.controlConfig!.stallProtection!),
+						reason: "stall_warning",
+					});
+					fireUpdate();
+				},
+				onRecovered: () => withdrawStallAttention(),
+				onWithdrawn: () => withdrawStallAttention(),
+				onCancel: () => {
+					if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut || abortedBySignal || hostStopReason !== undefined || session?.shutDown) return;
+					terminateForToolTimeout(formatStallCancelMessage(options.controlConfig!.stallProtection!));
+				},
+			})
+			: undefined;
 
 		/** The child run ended (or was forced to end); fold in the captures and finish. */
 		const settle = (promptError: unknown, forced = false): void => {

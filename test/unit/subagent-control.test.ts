@@ -401,3 +401,57 @@ describe("subagent control attention state", () => {
 		assert.equal(claimControlNotification(resolveControlConfig(), terminalEvent, seen, "subagent-worker-run-1-1"), true);
 	});
 });
+
+describe("stall protection config resolution", () => {
+	it("stays off unless explicitly opted in, at global or override level", () => {
+		assert.equal(resolveControlConfig().stallProtection, undefined);
+		assert.equal(resolveControlConfig({ enabled: true }).stallProtection, undefined);
+		assert.equal(resolveControlConfig(undefined, { stallProtection: { enabled: false } }).stallProtection, undefined);
+		assert.deepEqual(resolveControlConfig({ stallProtection: { enabled: true } }).stallProtection, {
+			enabled: true,
+			inactivityWindowMs: 30 * 60 * 1000,
+			graceMs: 2 * 60 * 1000,
+		});
+		assert.deepEqual(resolveControlConfig(undefined, { stallProtection: { enabled: true } }).stallProtection, {
+			enabled: true,
+			inactivityWindowMs: 30 * 60 * 1000,
+			graceMs: 2 * 60 * 1000,
+		});
+	});
+
+	it("lets an explicit per-call stallProtection replace the global one wholesale", () => {
+		const resolved = resolveControlConfig(
+			{ stallProtection: { enabled: true, inactivityWindowMs: 1_800_000 } },
+			{ stallProtection: { enabled: true, graceMs: 45_000 } },
+		);
+		assert.deepEqual(resolved.stallProtection, { enabled: true, inactivityWindowMs: 30 * 60 * 1000, graceMs: 45_000 });
+		// A per-call disable wins over an enabled global policy.
+		assert.equal(resolveControlConfig({ stallProtection: { enabled: true } }, { stallProtection: { enabled: false } }).stallProtection, undefined);
+	});
+
+	it("rejects invalid override shapes and falls back to the global value", () => {
+		const global = { stallProtection: { enabled: true, inactivityWindowMs: 123 } };
+		for (const bad of [
+			{ stallProtection: "yes" },
+			{ stallProtection: [1] },
+			{ stallProtection: { enabled: true, inactivityWindowMs: -5 } },
+			{ stallProtection: { enabled: "true" } },
+			{ stallProtection: { enabled: true, unknownField: 1 } },
+		]) {
+			assert.deepEqual(
+				resolveControlConfig(global, bad as never).stallProtection,
+				{ enabled: true, inactivityWindowMs: 123, graceMs: 2 * 60 * 1000 },
+				JSON.stringify(bad),
+			);
+		}
+	});
+
+	it("freezes the resolved config and its arrays for inherited propagation into child runtimes", () => {
+		const resolved = resolveControlConfig({ stallProtection: { enabled: true } });
+		assert.equal(Object.isFrozen(resolved), true);
+		assert.equal(Object.isFrozen(resolved.notifyOn), true);
+		assert.equal(Object.isFrozen(resolved.notifyChannels), true);
+		assert.ok(resolved.stallProtection);
+		assert.equal(Object.isFrozen(resolved.stallProtection), true);
+	});
+});

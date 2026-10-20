@@ -145,6 +145,11 @@ const ControlOverrides = Type.Object({
 	activeNoticeAfterTurns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional active-long-running notice threshold by assistant turns (disabled by default)" })),
 	activeNoticeAfterTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional active-long-running notice threshold by total tokens (disabled by default)" })),
 	failedToolAttemptsBeforeAttention: Type.Optional(Type.Integer({ minimum: 1, description: "Consecutive mutating-tool failures before escalating to needs_attention (default: 3)" })),
+	stallProtection: Type.Optional(Type.Object({
+		enabled: Type.Optional(Type.Boolean({ description: "Opt in to progress-aware stall protection (default: false)" })),
+		inactivityWindowMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2147483647, description: "No-meaningful-progress window before the stall warning (default: 1800000)" })),
+		graceMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2147483647, description: "Visible warning grace before stall cancellation if still no progress (default: 120000)" })),
+	}, { additionalProperties: false, description: "Opt-in inactivity cancellation: a child with no model/tool progress for the window gets a visible warning, then is cancelled after the grace. Inactivity is not proof of a deadlock; coordination waits suspend it." })),
 	notifyOn: Type.Optional(Type.Array(Type.String({ enum: ["active_long_running", "needs_attention"] }), {
 		description: "Control event types that should notify the parent/orchestrator. Defaults to active_long_running and needs_attention.",
 	})),
